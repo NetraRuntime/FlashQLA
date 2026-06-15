@@ -157,13 +157,10 @@ def fused_recurrent_gdr_verify_fwd(
     scale = scale or K ** -0.5
     store_intermediate = intermediate_states_buffer is not None
 
+    # block_DV=64 (2 V-tiles) @ threads=128 is the bandwidth sweet spot (autotuned, H100);
+    # 32 (4 V-tiles) for the low-CTA tail. block_DV=128 is occupancy-starved -> never used.
     grid_base = N * H
-    if grid_base >= TARGET_NUM_CTAS:
-        block_DV = 128
-    elif grid_base * 2 >= TARGET_NUM_CTAS:
-        block_DV = 64
-    else:
-        block_DV = 32
+    block_DV = 64 if grid_base * 2 >= TARGET_NUM_CTAS else 32
 
     kern = tilelang_fused_recurrent_gdr_verify(
         H,
@@ -182,7 +179,7 @@ def fused_recurrent_gdr_verify_fwd(
         store_intermediate=store_intermediate,
         disable_state_update=disable_state_update,
         block_DV=block_DV,
-        threads=max(128, block_DV * 2),
+        threads=128,
     )
     kern(q, k, v, g, beta, pool, state_indices, cu_seqlens,
          intermediate_state_indices, o, intermediate_states_buffer)
@@ -335,8 +332,8 @@ def fused_recurrent_gdr_verify_gated_fwd(
     scale = scale or K ** -0.5
     store_intermediate = intermediate_states_buffer is not None
 
-    grid_base = N * H
-    block_DV = 128 if grid_base >= TARGET_NUM_CTAS else (64 if grid_base * 2 >= TARGET_NUM_CTAS else 32)
+    grid_base = N * H  # bandwidth sweet spot (autotuned, H100): block_DV=64 @ threads=128
+    block_DV = 64 if grid_base * 2 >= TARGET_NUM_CTAS else 32
 
     kern = tilelang_fused_recurrent_gdr_verify_gated(
         H, Hg, K, V, scale,

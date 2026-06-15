@@ -133,13 +133,10 @@ def fused_recurrent_gdr_fwd(
     assert K == V == 128 and H % Hg == 0
     scale = scale or K ** -0.5
 
+    # Memory-bound: occupancy beats bigger tiles. block_DV=64 (2 V-tiles) at threads=128 is
+    # the bandwidth sweet spot (autotuned on H100); fall to 32 (4 V-tiles) for the low-CTA tail.
     grid_base = B * H
-    if grid_base >= TARGET_NUM_CTAS:
-        block_DV = 128
-    elif grid_base * 2 >= TARGET_NUM_CTAS:
-        block_DV = 64
-    else:
-        block_DV = 32
+    block_DV = 64 if grid_base * 2 >= TARGET_NUM_CTAS else 32
 
     use_initial_state = initial_state is not None
     if initial_state is None:
@@ -170,7 +167,7 @@ def fused_recurrent_gdr_fwd(
         store_final_state=output_final_state,
         has_seqlens=has_seqlens,
         block_DV=block_DV,
-        threads=max(128, block_DV * 2),
+        threads=128,
     )
     kern(q, k, v, g, beta, initial_state, seqlens, o, final_state)
     return o, (final_state if output_final_state else None)
