@@ -346,3 +346,181 @@ def fused_recurrent_gdr_verify_gated_fwd(
     kern(q, k, v, a, b, A_log, dt_bias, pool, state_indices, cu_seqlens,
          intermediate_state_indices, o, intermediate_states_buffer)
     return o
+
+
+# ----------------------------------------------------------------------------------------------
+# H1: gating + qk-l2norm DEDUP PRE-PASS.
+# The in-kernel-gated kernel above recomputes g/beta + qk-l2norm INSIDE the per-token hot loop,
+# once per (token, V-head, V-tile) CTA -> l2norm redundant grp*n_vt times per (token,K-head),
+# gating redundant n_vt times per (token,V-head). This pre-pass computes each ONCE (grid =
+# total_tokens*Hk, one CTA per (token, K-head)) and feeds the HOST-gated main kernel
+# (fused_recurrent_gdr_verify_fwd) whose hot loop then has NO transcendentals. Measured ceiling
+# (gated-vs-host-gated, H100): 14-16% at T=12 large batch. Regime-gated (see should_use_prepass):
+# at single-request the second-launch tax exceeds the small ceiling, so variant A is kept there.
+# ----------------------------------------------------------------------------------------------
+
+# Regime gate tunables (calibrated on H100, benchmark/bench_prepass.py, eager+CUDA-graph). Prepass
+# wins only when (a) drafts are long enough that the per-token gating/l2norm recompute it dedups is
+# a meaningful fraction (T_avg >= 4; at T=1 it is paid once -> nothing to dedup across tokens), AND
+# (b) the main-kernel work N*H*(1+T_avg) is large enough to amortize the extra-launch penalty.
+# Threshold = 3000 is conservative: it fires ONLY where the speedup is STABLE across runs and the
+# production CUDA-graph path (>=1.08x at every fired point even in a launch-overhead-contended eager
+# run). The three near-boundary regimes that win in clean eager / graph but are launch-noise-flaky
+# (N=4,T=12 work=1664; N=8,T=8 =2304; N=16,T=4 =2560) are routed to variant A -> zero regression
+# risk. The lowest stable win is N=8,T=12 (work=3328). Metric scales with H, so small-head configs
+# self-raise the batch needed (keeps the gate conservative for untested H<32).
+PREPASS_MIN_T = 4.0
+PREPASS_MIN_WORK = 3000
+
+
+def should_use_prepass(N, H, total_tokens):
+    """Static (capture-safe; shape-only) decision: run the dedup prepass + host-gated main kernel
+    (True) vs the single in-kernel-gated kernel A (False). Both produce identical output; this
+    only picks the faster path per regime. Variant A is the safe default for latency-bound
+    single-request / small-batch / T=1, where the extra prepass launch is a measured net loss."""
+    if N <= 0:
+        return False
+    t_avg = total_tokens / N
+    work = H * (N + total_tokens)  # == N*H*(1 + t_avg), proportional to the main-kernel runtime
+    return (t_avg >= PREPASS_MIN_T) and (work >= PREPASS_MIN_WORK)
+
+
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
+def tilelang_gdr_verify_prepass(
+    Hk, Hv, DK, accum_dtype, qk_dtype, ab_dtype, gate_dtype, g_out_dtype, b_out_dtype,
+    l2norm_eps=1e-6, softplus_thr=20.0, allow_neg_eigval=False, threads=128,
+):
+    """Dedup pre-pass: ONE CTA per token tt computes q_n/k_n = l2norm(q/k) for all Hk K-heads at
+    once via a parallel [Hk,DK] reduce (the proven reduce_sum(...,dim=1) idiom), and
+    g = -exp(A_log[h])*softplus(a+dt_bias) (RAW log-decay; the main kernel applies exp2) +
+    beta = beta_mul*sigmoid(b) for all Hv V-heads. No recurrence, no cu_seqlens (token-local):
+    the main kernel only consumes tokens within cu_seqlens, so normalizing trailing padding is
+    harmless.
+
+    q/k are read into a fragment and q_n/k_n written DIRECTLY from a full-range T.Parallel (the
+    head-batch global-write idiom) -- no per-row [1,DK] T.copy, so no serial Hk loop (that was a
+    measured ~6x slowdown) and no Hopper copy-layout trap. The gate write is the full contiguous
+    [1,Hv] row (Hv>=4 -> >=128-bit fp32 extent; a per-K-head [1,grp] write fails layout inference
+    for grp<4). Grid = total_tokens balances occupancy (~total_tokens CTAs)."""
+    beta_mul = 2.0 if allow_neg_eigval else 1.0
+    total_tokens = T.dynamic("total_tokens")
+    qk_shape = (1, total_tokens, Hk, DK)
+    ab_shape = (1, total_tokens, Hv)
+
+    @T.prim_func
+    def kernel(
+        q: T.Tensor(qk_shape, qk_dtype),
+        k: T.Tensor(qk_shape, qk_dtype),
+        a: T.Tensor(ab_shape, ab_dtype),
+        b: T.Tensor(ab_shape, ab_dtype),
+        A_log: T.Tensor([Hv], gate_dtype),
+        dt_bias: T.Tensor([Hv], gate_dtype),
+        q_n: T.Tensor(qk_shape, qk_dtype),
+        k_n: T.Tensor(qk_shape, qk_dtype),
+        g_out: T.Tensor(ab_shape, g_out_dtype),
+        beta_out: T.Tensor(ab_shape, b_out_dtype),
+    ):
+        with T.Kernel(total_tokens, threads=threads) as (tt,):
+            xf = T.alloc_fragment((Hk, DK), accum_dtype)   # raw q/k rows (reused q then k)
+            sq = T.alloc_fragment((Hk, DK), accum_dtype)   # squared, reduce input
+            ssq = T.alloc_fragment((Hk,), accum_dtype)     # per-K-head sum-of-squares
+            g_f = T.alloc_fragment((1, Hv), accum_dtype)
+            b_f = T.alloc_fragment((1, Hv), accum_dtype)
+            g_sh = T.alloc_shared((1, Hv), g_out_dtype)
+            b_sh = T.alloc_shared((1, Hv), b_out_dtype)
+
+            # q l2norm: load [Hk,DK] -> square -> reduce over DK -> normalize + write (all parallel)
+            for i, j in T.Parallel(Hk, DK):
+                xf[i, j] = q[0, tt, i, j]
+            for i, j in T.Parallel(Hk, DK):
+                sq[i, j] = xf[i, j] * xf[i, j]
+            T.reduce_sum(sq, ssq, dim=1)
+            for i, j in T.Parallel(Hk, DK):
+                q_n[0, tt, i, j] = xf[i, j] * T.rsqrt(ssq[i] + l2norm_eps)
+
+            # k l2norm (reuse xf/sq/ssq)
+            for i, j in T.Parallel(Hk, DK):
+                xf[i, j] = k[0, tt, i, j]
+            for i, j in T.Parallel(Hk, DK):
+                sq[i, j] = xf[i, j] * xf[i, j]
+            T.reduce_sum(sq, ssq, dim=1)
+            for i, j in T.Parallel(Hk, DK):
+                k_n[0, tt, i, j] = xf[i, j] * T.rsqrt(ssq[i] + l2norm_eps)
+
+            # gating for all Hv V-heads (fragment idiom, inlined exprs, direct global reads),
+            # staged through [1,Hv] shared and written as one contiguous row (>=128-bit extent)
+            for _i, h in T.Parallel(1, Hv):
+                g_f[0, h] = -T.exp(A_log[h]) * T.if_then_else(
+                    a[0, tt, h] + dt_bias[h] > softplus_thr,
+                    a[0, tt, h] + dt_bias[h],
+                    T.log(1.0 + T.exp(a[0, tt, h] + dt_bias[h])),
+                )
+                b_f[0, h] = beta_mul * T.sigmoid(b[0, tt, h])
+            for _i, h in T.Parallel(1, Hv):
+                g_sh[0, h] = g_f[0, h]
+                b_sh[0, h] = b_f[0, h]
+            T.copy(g_sh, g_out[0, tt : tt + 1, 0:Hv])
+            T.copy(b_sh, beta_out[0, tt : tt + 1, 0:Hv])
+
+    return kernel
+
+
+def fused_recurrent_gdr_verify_prepass(
+    q, k, a, b, A_log, dt_bias,
+    q_n=None, k_n=None, g_out=None, beta_out=None, allow_neg_eigval=False,
+):
+    """Dedup pre-pass dispatch. Computes q_n=l2norm(q), k_n=l2norm(k), g=raw log-decay,
+    beta=beta_mul*sigmoid(b) ONCE, feeding the host-gated verify main kernel. Buffers are
+    caller-provided for CUDA-graph capture safety (like o/pool/ibuf); allocate-if-None is an
+    EAGER convenience for tests/bench only -- it must NOT run inside a captured region (no alloc
+    in capture). g/beta are fp32 (matching gdn_sigmoid_gate); q_n/k_n match q/k dtype."""
+    _, total_tokens, Hk, K = q.shape
+    Hv = a.shape[2]
+    assert Hv % Hk == 0, f"num_v_heads {Hv} must be divisible by num_k_heads {Hk}"
+    assert total_tokens > 0
+    if q_n is None:
+        q_n = torch.empty_like(q)
+    if k_n is None:
+        k_n = torch.empty_like(k)
+    if g_out is None:
+        g_out = torch.empty(1, total_tokens, Hv, device=q.device, dtype=torch.float32)
+    if beta_out is None:
+        beta_out = torch.empty(1, total_tokens, Hv, device=q.device, dtype=torch.float32)
+
+    kern = tilelang_gdr_verify_prepass(
+        Hk, Hv, K,
+        accum_dtype="float32", qk_dtype=q.dtype, ab_dtype=a.dtype, gate_dtype=A_log.dtype,
+        g_out_dtype=g_out.dtype, b_out_dtype=beta_out.dtype,
+        allow_neg_eigval=allow_neg_eigval, threads=128,
+    )
+    kern(q, k, a, b, A_log, dt_bias, q_n, k_n, g_out, beta_out)
+    return q_n, k_n, g_out, beta_out
+
+
+# Module-level UNBOUNDED, never-evicting scratch cache for the prepass outputs. Unbounded is the
+# capture-safe choice: each captured graph bakes the device pointers of its own (total_tokens,...)
+# entry; an evicting LRU (e.g. utils.tensor_cache) could free a still-referenced storage and make
+# a later replay read freed memory. One live entry per captured (N,T); entries are never freed.
+_PREPASS_SCRATCH = {}
+
+
+def get_prepass_scratch(total_tokens, Hk, Hv, device, qk_dtype):
+    """Persistent prepass scratch (q_n,k_n bf16 [1,T,Hk,128]; g,beta fp32 [1,T,Hv]). Allocated
+    lazily on the first (warmup) call and reused thereafter so addresses are stable across
+    CUDA-graph capture/replay. Raises (rather than allocating + aborting capture) on a cold miss
+    during capture -- warmup must exercise every (N,T) that will be captured."""
+    key = (total_tokens, Hk, Hv, device, qk_dtype)
+    buf = _PREPASS_SCRATCH.get(key)
+    if buf is None:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"prepass scratch not warmed for shape {key}; run an eager warmup pass before "
+                "CUDA-graph capture (the scratch must be allocated outside the captured region)."
+            )
+        q_n = torch.empty(1, total_tokens, Hk, 128, device=device, dtype=qk_dtype)
+        k_n = torch.empty(1, total_tokens, Hk, 128, device=device, dtype=qk_dtype)
+        g_out = torch.empty(1, total_tokens, Hv, device=device, dtype=torch.float32)
+        beta_out = torch.empty(1, total_tokens, Hv, device=device, dtype=torch.float32)
+        buf = (q_n, k_n, g_out, beta_out)
+        _PREPASS_SCRATCH[key] = buf
+    return buf
