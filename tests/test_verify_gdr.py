@@ -171,6 +171,63 @@ def test_verify_cuda_graph():
 
 
 @CUDA
+def test_verify_negctrl_vmajor_transpose():
+    # discriminating: the V-major ibuf must DIFFER from a transposed-major reference
+    N, D, H = 4, 4, 8
+    q, k, v, g, beta, pool, si, cu, ibuf, ci = _mk(N, D, H, H, num_slots=N, distinct_gate=True)
+    o = torch.empty(1, q.shape[1], H, 128, device="cuda", dtype=torch.bfloat16)
+    o_ref, _, ibuf_ref = verify_ref(q, k, v, g, beta, pool, si, cu, ibuf, ci, disable_state_update=True)
+    fused_recurrent_gdr_verify_fwd(q, k, v, g, beta, pool, si, cu, ibuf, ci, o, disable_state_update=True)
+    assert _rel(ibuf, ibuf_ref) <= 0.02
+    ibuf_wrong = ibuf_ref.transpose(-1, -2).contiguous()  # K/V swapped (the silent-bug case)
+    assert _rel(ibuf, ibuf_wrong) > 0.2  # the test discriminates a wrong major-order
+
+
+@CUDA
+def test_verify_gated_cuda_graph():
+    # the fully in-kernel gated path (no PyTorch gating/l2norm) is the capture-safe SGLang entry
+    from flash_qla.ops.gated_delta_rule.fused_recurrent.hopper.fused_recurrent_verify import (
+        fused_recurrent_gdr_verify_gated_fwd,
+    )
+    N, D, H = 4, 4, 8
+    total = N * D
+    torch.manual_seed(3)
+    q = torch.randn(1, total, H, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, total, H, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, total, H, 128, device="cuda", dtype=torch.bfloat16)
+    a = torch.randn(1, total, H, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(1, total, H, device="cuda", dtype=torch.bfloat16)
+    A_log = torch.randn(H, device="cuda").abs().log()
+    dt_bias = torch.randn(H, device="cuda")
+    pool = torch.randn(N, H, 128, 128, device="cuda", dtype=torch.bfloat16)
+    cu = torch.arange(0, total + 1, D, dtype=torch.int32, device="cuda")
+    si = torch.arange(N, dtype=torch.int32, device="cuda")
+    ci = torch.arange(N, dtype=torch.int32, device="cuda")
+    ibuf = torch.zeros(N + 1, D, H, 128, 128, device="cuda", dtype=torch.bfloat16)
+    o = torch.empty(1, total, H, 128, device="cuda", dtype=torch.bfloat16)
+
+    def run():
+        fused_recurrent_gdr_verify_gated_fwd(
+            q, k, v, a, b, A_log, dt_bias, pool, si, cu, ibuf, ci, o, disable_state_update=True)
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.cuda.synchronize()
+    o_eager = torch.empty_like(o)
+    fused_recurrent_gdr_verify_gated_fwd(
+        q, k, v, a, b, A_log, dt_bias, pool, si, cu, ibuf, ci, o_eager, disable_state_update=True)
+    assert torch.equal(o, o_eager), "in-kernel gated graph replay must match eager"
+
+
+@CUDA
 def test_verify_skip_slot():
     # a -1 pool slot must skip gather/commit/intermediate writes for that request
     N, D, H = 3, 4, 8

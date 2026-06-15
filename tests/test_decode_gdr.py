@@ -102,6 +102,32 @@ def test_kernel_high_occupancy(B, H):
     assert (s_qla - s_ref).abs().max() / s_ref.abs().max() <= 0.02
 
 
+@CUDA
+def test_negctrl_step_order():
+    # discriminating: kernel matches the post-update reference and DIFFERS from a pre-update one
+    from flash_qla import recurrent_gated_delta_rule
+    B, D, H = 1, 6, 8
+    q, k, v, g, beta = _ref_bf16_inputs(B, D, H, H)
+    o_post, _ = decode_recur(q, k, v, g, beta, scale=128 ** -0.5)
+    o_pre, _ = decode_recur(q, k, v, g, beta, scale=128 ** -0.5, read_pre_update=True)
+    o_qla, _ = recurrent_gated_delta_rule(q, k, v, g, beta, scale=128 ** -0.5)
+    assert (o_qla.float() - o_post).abs().max() / o_post.abs().max() <= 0.02
+    assert (o_qla.float() - o_pre).abs().max() / o_pre.abs().max() > 0.2  # must NOT match wrong order
+
+
+@CUDA
+def test_negctrl_gqa_mapping():
+    # discriminating: kernel uses hg=h//grp and must DIFFER from the hg=h%Hk mapping
+    from flash_qla import recurrent_gated_delta_rule
+    B, D, Hk, Hv = 1, 6, 2, 8
+    q, k, v, g, beta = _ref_bf16_inputs(B, D, Hk, Hv)
+    o_div, _ = decode_recur(q, k, v, g, beta, scale=128 ** -0.5)
+    o_mod, _ = decode_recur(q, k, v, g, beta, scale=128 ** -0.5, gqa_mod=True)
+    o_qla, _ = recurrent_gated_delta_rule(q, k, v, g, beta, scale=128 ** -0.5)
+    assert (o_qla.float() - o_div).abs().max() / o_div.abs().max() <= 0.02
+    assert (o_qla.float() - o_mod).abs().max() / o_mod.abs().max() > 0.2  # must NOT match wrong GQA
+
+
 def test_signature_contract():
     import inspect
     from flash_qla import recurrent_gated_delta_rule

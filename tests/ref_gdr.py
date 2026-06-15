@@ -709,9 +709,13 @@ def decode_recur(
     scale=None,
     initial_state=None,  # initial_state: [B,Hv,128,128] fp32 or None
     seqlens=None,  # [B] int32 accepted lengths (default: all T)
+    read_pre_update=False,  # NEGATIVE CONTROL: read o before the rank-1 (wrong)
+    gqa_mod=False,  # NEGATIVE CONTROL: hg = h % Hk (wrong GQA mapping)
 ):
     """Ground-truth GDN decode recurrence (spec 2): per (b,h), per token t<L_b:
-    S*=exp(g); kS=k@S; v_new=beta*(v-kS); S+=outer(k,v_new); o=scale*(q@S)."""
+    S*=exp(g); kS=k@S; v_new=beta*(v-kS); S+=outer(k,v_new); o=scale*(q@S).
+    The read_pre_update / gqa_mod flags intentionally compute the WRONG result for
+    negative-control tests (the kernel must match the default and differ from these)."""
     B, T, Hk, K = k.shape
     _, _, Hv, V = v.shape
     assert K == V == 128 and Hv % Hk == 0
@@ -730,7 +734,7 @@ def decode_recur(
         L = int(seqlens[b])
         for t in range(L):
             for h in range(Hv):
-                hg = h // grp
+                hg = (h % Hk) if gqa_mod else (h // grp)
                 qt = q[b, t, hg].float()
                 kt = k[b, t, hg].float()
                 vt = v[b, t, h].float()
@@ -738,9 +742,12 @@ def decode_recur(
                 Sh = S[b, h] * decay  # [K,V]
                 kS = kt @ Sh  # [V]
                 v_new = beta[b, t, h].float() * (vt - kS)  # [V]
+                if read_pre_update:
+                    o[b, t, h] = scale * (qt @ Sh)  # WRONG: pre rank-1
                 Sh = Sh + torch.outer(kt, v_new)  # [K,V]
                 S[b, h] = Sh
-                o[b, t, h] = scale * (qt @ Sh)  # [V]
+                if not read_pre_update:
+                    o[b, t, h] = scale * (qt @ Sh)  # [V] (post-update, correct)
     return o, S  # o:[B,T,Hv,V] (only [:, :L_b] valid per b), final_state S:[B,Hv,K,V]
 
 

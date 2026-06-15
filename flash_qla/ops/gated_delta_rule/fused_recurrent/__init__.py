@@ -32,7 +32,7 @@ def recurrent_gated_delta_rule(
     beta,
     scale=None,
     initial_state=None,
-    output_final_state=False,
+    output_final_state=True,
     use_qk_l2norm_in_kernel=False,
     seqlens=None,
     head_first=False,
@@ -91,15 +91,23 @@ def recurrent_gated_delta_rule_verify(
     disable_state_update=True,
     allow_neg_eigval=False,
     fuse_gating=False,
+    retrieve_parent_token=None,  # accepted-and-IGNORED (DFlash width-1; tree path not built)
 ):
     """High-level SGLang DFlash verify entry. q,k:[1,T,Hk,128] v:[1,T,Hv,128]; a,b:[1,T,Hv];
     A_log,dt_bias:[Hv]; ssm_states pool V-major [num_slots,Hv,128,128].
 
-    fuse_gating=False (default): host-side (PyTorch, capture-safe) g/beta + qk-l2norm, then
-    the paged V-major verify kernel. fuse_gating=True: compute g/beta + qk-l2norm inside the
-    kernel from raw (a,b,A_log,dt_bias) -- one fewer launch / no gating intermediates."""
+    CUDA-graph note: for capture, use ``fuse_gating=True`` (computes g/beta + qk-l2norm INSIDE
+    the kernel from raw a,b,A_log,dt_bias -- no PyTorch gating/l2norm, no allocation when ``o``
+    is provided -> fully capture-safe). The default ``fuse_gating=False`` path computes g/beta +
+    qk-l2norm in PyTorch (l2norm is ``@torch.compile``'d) and allocates them; run it OUTSIDE
+    capture or prefer ``fuse_gating=True`` inside it."""
     assert q.dtype == k.dtype == v.dtype and q.dtype != torch.float32
     assert q.shape[-1] == v.shape[-1] == 128 and v.shape[2] % k.shape[2] == 0
+    if cache_steps is not None:  # static shape check (capture-safe; no value read)
+        assert intermediate_states_buffer.shape[1] >= cache_steps, (
+            f"intermediate_states_buffer cache-steps dim {intermediate_states_buffer.shape[1]} "
+            f"< cache_steps {cache_steps}"
+        )
     scale = scale if scale is not None else q.shape[-1] ** -0.5
     if o is None:
         o = torch.empty(1, q.shape[1], v.shape[2], v.shape[-1], device=q.device, dtype=q.dtype)
