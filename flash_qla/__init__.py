@@ -11,6 +11,8 @@ from flash_qla.ops.gated_delta_rule.chunk import (
 from flash_qla.ops.gated_delta_rule.fused_recurrent import (
     fused_recurrent_gdr_fwd,
     recurrent_gated_delta_rule,
+    fused_recurrent_gdr_verify_fwd,
+    recurrent_gated_delta_rule_verify,
 )
 
 __all__ = [
@@ -19,4 +21,6 @@ __all__ = [
     "chunk_gated_delta_rule",
     "fused_recurrent_gdr_fwd",
     "recurrent_gated_delta_rule",
+    "fused_recurrent_gdr_verify_fwd",
+    "recurrent_gated_delta_rule_verify",
 ]

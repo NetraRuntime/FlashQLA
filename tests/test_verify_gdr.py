@@ -77,6 +77,65 @@ def test_verify_distinct_gate_vmajor():
 
 
 @CUDA
+def test_verify_wrapper_gating():
+    # high-level wrapper: host-side sigmoid gating + l2norm must match a hand-built reference
+    from flash_qla import recurrent_gated_delta_rule_verify
+    from flash_qla.ops.gated_delta_rule.fused_recurrent import gdn_sigmoid_gate
+
+    N, D, H = 4, 4, 8
+    total = N * D
+    torch.manual_seed(1)
+    q = torch.randn(1, total, H, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, total, H, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, total, H, 128, device="cuda", dtype=torch.bfloat16)
+    a = torch.randn(1, total, H, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(1, total, H, device="cuda", dtype=torch.bfloat16)
+    A_log = torch.randn(H, device="cuda").abs().log()
+    dt_bias = torch.randn(H, device="cuda")
+    pool = torch.randn(N, H, 128, 128, device="cuda", dtype=torch.bfloat16)
+    cu = torch.arange(0, total + 1, D, dtype=torch.int32, device="cuda")
+    si = torch.arange(N, dtype=torch.int32, device="cuda")
+    ci = torch.arange(N, dtype=torch.int32, device="cuda")
+    ibuf = torch.zeros(N + 1, D, H, 128, 128, device="cuda", dtype=torch.bfloat16)
+
+    g_ref, beta_ref = gdn_sigmoid_gate(A_log, a, dt_bias, b)
+    o_ref, _, ibuf_ref = verify_ref(
+        l2norm(q), l2norm(k), v, g_ref, beta_ref, pool, si, cu, ibuf, ci, disable_state_update=True)
+    o = recurrent_gated_delta_rule_verify(
+        A_log, a, dt_bias, q, k, v, b, pool, si, cu, ibuf, ci, disable_state_update=True)
+    assert _rel(o, o_ref) <= 0.02
+    assert _rel(ibuf, ibuf_ref) <= 0.02
+
+
+@CUDA
+def test_verify_cuda_graph():
+    # the low-level entry must be CUDA-graph capturable (no host sync / no alloc) and replay correctly
+    N, D, H = 4, 4, 8
+    q, k, v, g, beta, pool, si, cu, ibuf, ci = _mk(N, D, H, H, num_slots=N)
+    o = torch.empty(1, q.shape[1], H, 128, device="cuda", dtype=torch.bfloat16)
+
+    def run():
+        fused_recurrent_gdr_verify_fwd(q, k, v, g, beta, pool, si, cu, ibuf, ci, o, disable_state_update=True)
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(s)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    o_eager = torch.empty_like(o)
+    fused_recurrent_gdr_verify_fwd(q, k, v, g, beta, pool, si, cu, ibuf, ci, o_eager, disable_state_update=True)
+    assert torch.equal(o, o_eager), "graph replay must match eager"
+
+
+@CUDA
 def test_verify_skip_slot():
     # a -1 pool slot must skip gather/commit/intermediate writes for that request
     N, D, H = 3, 4, 8
