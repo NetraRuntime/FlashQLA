@@ -308,10 +308,19 @@ def fused_recurrent_gdr_fwd(
             q, k, v, g, beta, scale, initial_state, output_final_state, seqlens, grp
         )
 
-    # Memory-bound: occupancy beats bigger tiles. block_DV=64 (2 V-tiles) at threads=128 is
-    # the bandwidth sweet spot (autotuned on H100); fall to 32 (4 V-tiles) for the low-CTA tail.
+    # Tile selection. When writing the final state (`output_final_state`, the decode default), the
+    # K-major transposed store `ht[bb,bh,jk,v0+jv] = S[jv,jk]` is the dominant cost: at block_DV<128
+    # it is catastrophically uncoalesced (~0.4 TB/s), but at block_DV=128 (full-V tile, n_vt=1) the
+    # transpose coalesces -> measured ~2x faster at EVERY batch size (1.35x @ B=1 .. 3.0x @ B=8-16
+    # .. 2.0x @ B=256; benchmark/probe_h2_blockdv_crossover.py, final_state bit-identical). So force
+    # block_DV=128 whenever we store the final state. (This inverts the verify kernel's V-major
+    # choice of 64 -- that store needs no transpose, so there occupancy wins; here the write does.)
+    # No final-state write: keep the occupancy ladder (64/32) -- block_DV is then perf-neutral.
     grid_base = B * H
-    block_DV = 64 if grid_base * 2 >= TARGET_NUM_CTAS else 32
+    if output_final_state:
+        block_DV = 128
+    else:
+        block_DV = 64 if grid_base * 2 >= TARGET_NUM_CTAS else 32
 
     use_initial_state = initial_state is not None
     if initial_state is None:
