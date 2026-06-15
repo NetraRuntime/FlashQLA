@@ -11,6 +11,10 @@ import torch
 
 from flash_qla import recurrent_gated_delta_rule_verify
 from flash_qla.ops.gated_delta_rule.fused_recurrent import should_use_prepass
+from flash_qla.ops.gated_delta_rule.fused_recurrent.hopper.fused_recurrent_verify import (
+    PREPASS_MIN_T,
+    PREPASS_MIN_WORK,
+)
 
 
 def _time(fn, iters=100, warmup=50):
@@ -98,7 +102,8 @@ def bench(N, T, Hk, Hv, tag):
 
 
 def bench_graph(N, T, Hk, Hv):
-    # CUDA-graph (production) timing of variant A vs the prepass path
+    # CUDA-graph (production) timing of variant A vs the prepass path, WITH gate calibration:
+    # print work + the current gate's auto decision + MISCAL (gate picks the measurably-wrong path).
     kw = _inputs(N, T, Hk, Hv)
     fA = lambda: recurrent_gated_delta_rule_verify(fuse_gating=True, prepass=False, **kw)
     fP = lambda: recurrent_gated_delta_rule_verify(fuse_gating=True, prepass=True, **kw)
@@ -106,24 +111,39 @@ def bench_graph(N, T, Hk, Hv):
     tA = _time_graph(fA)
     tP = _time_graph(fP)
     sp = tA / tP if tP > 0 else 0.0
-    print(f"  [graph] N={N:<4d} T={T:<2d} Hk={Hk} Hv={Hv}  A={tA:8.1f}us  prepass={tP:8.1f}us  speedup={sp:4.2f}x")
+    work = Hv * (N + N * T)
+    auto = should_use_prepass(N, Hv, N * T)
+    win = "WIN " if sp >= 1.05 else ("loss" if sp <= 0.97 else "neut")
+    agree = "ok"
+    if auto and sp <= 0.97:
+        agree = "MISCAL"  # gate fired prepass but it regressed under graphs
+    elif (not auto) and sp >= 1.05:
+        agree = "MISCAL"  # gate kept A but prepass would have won under graphs
+    print(f"  [graph] N={N:<4d} T={T:<2d} Hv={Hv:<2d} work={work:<6d}  "
+          f"A={tA:8.1f}us  prepass={tP:8.1f}us  speedup={sp:4.2f}x [{win}]  "
+          f"auto={'PP' if auto else 'A '} [{agree}]")
 
 
 def main():
     sm = torch.cuda.get_device_properties().multi_processor_count
-    print(f"device={torch.cuda.get_device_name()} SMs={sm} (TARGET_CTAS={int(sm*0.7)})\n")
-    print("== T sweep at fixed server heads (Hk=16,Hv=32) across batch (EAGER) ==")
-    for N in (4, 8, 16, 32, 64, 256):
-        for T in (1, 4, 8, 12):
-            bench(N, T, 16, 32, "sweep")
-        print()
-    print("== single-request / TP (N=1, T=12) -- expect AUTO=A (variant A wins) ==")
-    for Hv in (64, 32, 16, 8):
-        bench(1, 12, max(1, Hv // 4), Hv, "lat")
-    print("\n== CUDA-graph (production) timing, headline regime (Hk=16,Hv=32) ==")
-    for N in (16, 64, 256):
-        for T in (4, 12):
+    print(f"device={torch.cuda.get_device_name()} SMs={sm} (TARGET_CTAS={int(sm*0.7)})")
+    print(f"gate: PREPASS_MIN_T={PREPASS_MIN_T} PREPASS_MIN_WORK={PREPASS_MIN_WORK}  "
+          f"(work=Hv*N*(1+T); prepass if t_avg>=MIN_T AND work>=MIN_WORK)\n")
+    # PRODUCTION path is CUDA-graph: the prepass's 2nd launch shrinks to a graph node, so the
+    # loss->win crossover sits at SMALLER work than the eager-calibrated gate assumes. Sweep the
+    # small-N crossover zone under graphs to find where the prepass actually starts winning, and
+    # flag where the current gate mis-fires. The N=1/T=12 floor (work=416) MUST stay loss/off.
+    print("== CUDA-graph (production) crossover calibration, T in {4,8,12} (Hk=16,Hv=32) ==")
+    for N in (1, 2, 4, 8, 16, 32, 64, 256):
+        for T in (4, 8, 12):
             bench_graph(N, T, 16, 32)
+        print()
+    print("== T=1 (decode path) under graphs -- t_avg<MIN_T keeps prepass OFF; expect no win ==")
+    for N in (8, 32, 128):
+        bench_graph(N, 1, 16, 32)
+    print("\n== N=1 single-request EAGER sanity (must remain A / loss) ==")
+    for Hv in (64, 32, 16):
+        bench(1, 12, max(1, Hv // 4), Hv, "lat")
 
 
 if __name__ == "__main__":

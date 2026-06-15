@@ -359,25 +359,33 @@ def fused_recurrent_gdr_verify_gated_fwd(
 # at single-request the second-launch tax exceeds the small ceiling, so variant A is kept there.
 # ----------------------------------------------------------------------------------------------
 
-# Regime gate tunables (calibrated on H100, benchmark/bench_prepass.py, eager+CUDA-graph). Prepass
-# wins only when (a) drafts are long enough that the per-token gating/l2norm recompute it dedups is
-# a meaningful fraction (T_avg >= 4; at T=1 it is paid once -> nothing to dedup across tokens), AND
-# (b) the main-kernel work N*H*(1+T_avg) is large enough to amortize the extra-launch penalty.
-# Threshold = 3000 is conservative: it fires ONLY where the speedup is STABLE across runs and the
-# production CUDA-graph path (>=1.08x at every fired point even in a launch-overhead-contended eager
-# run). The three near-boundary regimes that win in clean eager / graph but are launch-noise-flaky
-# (N=4,T=12 work=1664; N=8,T=8 =2304; N=16,T=4 =2560) are routed to variant A -> zero regression
-# risk. The lowest stable win is N=8,T=12 (work=3328). Metric scales with H, so small-head configs
-# self-raise the batch needed (keeps the gate conservative for untested H<32).
+# Regime gate tunables. CALIBRATED FOR THE CUDA-GRAPH (production) PATH (H100,
+# benchmark/bench_prepass.py bench_graph, _time_graph with 50+ warmup). Prepass wins when (a) drafts
+# are long enough that the per-token gating/l2norm recompute it dedups is a meaningful fraction
+# (T_avg >= 4; at T=1 it is paid once -> nothing to dedup across tokens, measured neutral/loss even
+# under graphs), AND (b) the main-kernel work N*H*(1+T_avg) clears a SMALL floor.
+#
+# KEY: under CUDA-graph REPLAY the prepass's 2nd launch shrinks to a graph node, so the eager
+# second-launch tax (~13-15us) VANISHES and the dedup win dominates down to SINGLE-REQUEST. Measured
+# (graph, Hk=16 Hv=32): N=1,T=12 work=416 -> 1.18x WIN (eager was 0.60x LOSS); N=2,T=12 -> 1.08x;
+# N=4,T=12 -> 1.18x; every T=12 point N>=1 wins 1.08-1.24x. The only graph losses are work<=320
+# (N=1,T=4=160 0.96x; N=2,T=4=320 0.93x). So the gate window for the verify (always T=12) is
+# work in (320, 416]; MIN_WORK=384 fires the prepass for the ENTIRE T=12 verify path incl. N=1,
+# capturing the 1.08-1.24x the old eager-conservative 3000 was leaving on the table at small batch.
+# TRADEOFF: this assumes the CUDA-graph deployment (qwen36 captures all batch sizes). Under EAGER
+# (warmup / --disable-cuda-graph), small-N now pays the 2nd-launch tax (N=1,T=12 eager 0.60x) -- but
+# steady-state production verify is always captured, and warmup is untimed. Metric scales with H, so
+# small-head configs self-raise the batch needed (gate stays safe for untested H<32).
 PREPASS_MIN_T = 4.0
-PREPASS_MIN_WORK = 3000
+PREPASS_MIN_WORK = 384  # graph-calibrated (was 3000, eager-conservative); floor below N=1/T=12 work=416
 
 
 def should_use_prepass(N, H, total_tokens):
     """Static (capture-safe; shape-only) decision: run the dedup prepass + host-gated main kernel
     (True) vs the single in-kernel-gated kernel A (False). Both produce identical output; this
-    only picks the faster path per regime. Variant A is the safe default for latency-bound
-    single-request / small-batch / T=1, where the extra prepass launch is a measured net loss."""
+    only picks the faster path per regime. CALIBRATED FOR THE CUDA-GRAPH (production) path, where
+    the prepass's 2nd launch is a free graph node and it wins down to single-request T>=4 (the eager
+    second-launch tax that favored variant A at small batch does NOT exist under graph replay)."""
     if N <= 0:
         return False
     t_avg = total_tokens / N
