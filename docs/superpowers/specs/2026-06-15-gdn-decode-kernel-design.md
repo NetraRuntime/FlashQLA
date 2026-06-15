@@ -4,6 +4,8 @@ Date: 2026-06-15
 Status: Design approved in principle (pending written-spec review)
 Scope: Forward/inference-only fused **recurrent** (decode) kernel for Gated Delta Rule (GDN), to sit beside the existing chunked-prefill kernels in FlashQLA.
 
+> **IMPLEMENTATION STATUS (2026-06-15, validated on a Modal H100).** The core decode kernel is **built and passing** (19 tests). It is **gemm-free** rather than the `gemm_v1`-based design in §3: the GEMVs are `T.reduce_sum` over K and the rank-1 is a `T.Parallel` outer product, state `[block_DV, DK]` fp32 (Gate 1 — `gemm_v1` needs M%16==0 *and* num_warps≤N/16 — is unworkable for single-token GEMVs at small `block_DV`; gemm-free is simpler, fp32-accurate, and hit no warp-partition/layout walls). The §11 gate outcomes on H100: M=1 gemm **fails** (gemm-free moots it); `T.serial(L)` and the V-first transpose store **work**; TileLang `log2/rsqrt/exp` **lower** (so in-kernel gating is feasible, used by the verify kernel). The head-batched variant (§7) is **not built** — V-split alone reaches 60–67% of peak HBM in the server regime (see the verify spec). See `2026-06-15-gdn-verify-sglang-design.md` for the SGLang verify build that reuses this spine.
+
 ---
 
 ## 1. Overview & goals
