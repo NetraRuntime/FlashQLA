@@ -698,3 +698,47 @@ def chunk_gated_delta_rule_bwd(
         dk = torch.sum(dk.reshape(B, T, Hg, -1, K), dim=3)
     dg = torch_cumsum(dg, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens)
     return dq, dk, dv, db, dg, dh0
+
+
+def decode_recur(
+    q,
+    k,
+    v,
+    g,
+    beta,  # q,k:[B,T,Hk,128]  v:[B,T,Hv,128]  g,beta:[B,T,Hv]
+    scale=None,
+    initial_state=None,  # initial_state: [B,Hv,128,128] fp32 or None
+    seqlens=None,  # [B] int32 accepted lengths (default: all T)
+):
+    """Ground-truth GDN decode recurrence (spec 2): per (b,h), per token t<L_b:
+    S*=exp(g); kS=k@S; v_new=beta*(v-kS); S+=outer(k,v_new); o=scale*(q@S)."""
+    B, T, Hk, K = k.shape
+    _, _, Hv, V = v.shape
+    assert K == V == 128 and Hv % Hk == 0
+    scale = scale if scale is not None else K ** -0.5
+    grp = Hv // Hk
+    dev = k.device
+    S = (
+        initial_state.clone().float()
+        if initial_state is not None
+        else torch.zeros(B, Hv, K, V, device=dev, dtype=torch.float32)
+    )
+    o = torch.zeros(B, T, Hv, V, device=dev, dtype=torch.float32)
+    if seqlens is None:
+        seqlens = torch.full((B,), T, device=dev, dtype=torch.int32)
+    for b in range(B):
+        L = int(seqlens[b])
+        for t in range(L):
+            for h in range(Hv):
+                hg = h // grp
+                qt = q[b, t, hg].float()
+                kt = k[b, t, hg].float()
+                vt = v[b, t, h].float()
+                decay = torch.exp(g[b, t, h].float())
+                Sh = S[b, h] * decay  # [K,V]
+                kS = kt @ Sh  # [V]
+                v_new = beta[b, t, h].float() * (vt - kS)  # [V]
+                Sh = Sh + torch.outer(kt, v_new)  # [K,V]
+                S[b, h] = Sh
+                o[b, t, h] = scale * (qt @ Sh)  # [V]
+    return o, S  # o:[B,T,Hv,V] (only [:, :L_b] valid per b), final_state S:[B,Hv,K,V]
