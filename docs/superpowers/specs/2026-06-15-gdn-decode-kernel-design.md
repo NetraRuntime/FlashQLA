@@ -67,15 +67,17 @@ Single-role, memory-bound kernel. **Not** the chunk kernel's 512-thread / 4-warp
 `gemm_v1` is the **only** grounded K-reduction idiom in the repo. (A `T.Parallel` + `reduce_sum(dim=0)`-to-vector reduction over K=128 does **not** exist here — `reduce_sum(dim=0)` appears once, `fused_bwd.py:476`, reducing a 1-D fragment to a scalar — and is rejected.)
 
 - **Step 3 `kS = K @ S`:** `T.gemm_v1(k_op_shared, h_op_shared_decayed, kS_fragment, clear_accum=True)` — mirrors `U = K@S` at `fused_fwd.py:254`.
-- **Step 5 rank-1 `S += k ⊗ v_new`:** the `T.Parallel(DK, block_DV)` FMA `h_fragment[i,j] += k[i]·v_new[j]` (grounded in the `fused_fwd.py:197` decay idiom; needs no SMEM operand, no M-padding). *(A `transpose_A` rank-1 gemm into `h_fragment` is the `fused_fwd.py:204` alternative since the core state is a fragment — but the `T.Parallel` FMA is the primary path; it is also the only legal path in the head-batched variant where state is in SMEM.)*
+- **Step 5 rank-1 `S += k ⊗ v_new`:** the **`transpose_A` gemm-into-fragment** `T.gemm_v1(k_op_shared, vn_op_shared, h_fragment, transpose_A=True, clear_accum=False)` — the grounded rank-1 idiom at `fused_fwd.py:204` (Kᵀ@V′ accumulating into the register fragment). *(Correction: `fused_fwd.py:197` is a **scalar-broadcast** decay FMA, **not** a two-vector outer product, so a `T.Parallel(DK,block_DV): h[i,j]+=k[i]·v_new[j]` FMA is **not** grounded — it is a prototype-gated item (§11.E), reserved for the head-batched SMEM-state case where `gemm_v1` cannot accumulate into shared.)*
 - **Step 6 `o = Q @ S`:** `T.gemm_v1(q_op_shared, h_op_shared_postupdate, o_fragment, clear_accum=True)`, then `o_fragment *= scale`.
 - **Decay (step 2):** `for j_k, j_v in T.Parallel(DK, block_DV): h_fragment[j_k,j_v] *= decay` (`fused_fwd.py:197`).
 
 ### Step ordering (critical — post-update read)
-Per step: (a) l2norm already done host-side; (b) decay `h_fragment` in place; (c) copy/downcast `h_fragment → h_op_shared`; (d) gemm `kS` on decayed state; (e) `v_new = β·(v − kS)` in fp32; (f) rank-1 FMA into `h_fragment`; (g) copy/downcast `h_fragment → h_op_shared` again; (h) gemm `o` on post-update state, `*= scale`, cast, store `o[b,t,h, bv-slice]`. After the loop: `if store_final_state: T.copy(h_fragment, final_state[b,h,:, bv-slice])` once.
+Per step: (a) l2norm already done host-side; (b) decay `h_fragment` in place; (c) copy/downcast `h_fragment → h_op_shared`; (d) gemm `kS` on decayed state; (e) `v_new = β·(v − kS)` in fp32; (f) `transpose_A` rank-1 gemm into `h_fragment`; (g) copy/downcast `h_fragment → h_op_shared` again; (h) gemm `o` on post-update state, `*= scale`, cast, store `o[b,t,h, bv-slice]`. After the loop: `if store_final_state: T.copy(h_fragment, final_state[b,h,:, bv-slice])` once.
+
+Note: because each step's `v_new` depends on the running state, the `D` tokens **cannot** be batched into one gemm — all three contractions are **per-step, M=1** (a single token). So §11.A's `M=1` feasibility gate applies to all three, every step.
 
 ### M-dim (q_len) and the gemm
-`q_len` is the gemm M-dim. **Open feasibility item (§11.A):** confirm `gemm_v1` accepts `M = q_len < 16` (often `M=1`). Mitigation: zero-pad the M (token) dim of `q/k` staging to 16 (zero rows make zero rank-1 contribution and produce garbage `o` rows we don't store); or keep the rank-1 update as the `T.Parallel` FMA (no gemm) and pad only the two GEMVs. Prototype `M=1` first.
+Each step is a single token, so the gemm M (token) dim is **1**. **Open feasibility item (§11.A):** confirm `gemm_v1` accepts `M=1` (every repo `gemm_v1` is `M=64`). Mitigation: zero-pad the M (token) dim of `q/k/vn` staging to 16 (zero rows contribute zero to the rank-1 update and produce garbage `o` rows we don't store). Prototype `M=1` first; this gates the whole engine.
 
 ---
 
@@ -239,13 +241,14 @@ Add `benchmark/bench_recurrent_gdr.py` mirroring `bench_gated_delta_rule.py`. Ba
 
 These pick between grounded fallbacks; the architecture holds regardless.
 
-- **A. `gemm_v1` at `M = q_len < 16` (often `M=1`).** Every repo `gemm_v1` uses `M=64`. Mitigation: zero-pad M to 16, or use the `T.Parallel` FMA for the rank-1 update (pad only the two GEMVs). Compile-test `M=1` before committing.
+- **A. `gemm_v1` at `M=1`** (every step is a single token; every repo `gemm_v1` is `M=64`). The **root gate** — all three contractions (`kS`, rank-1, `o`) are `M=1`. Mitigation: zero-pad the M dim to 16 (zero rows contribute zero; discard garbage `o` rows). Compile-test `M=1` before any other work.
 - **B. `T.serial(L)` with a runtime per-CTA `L` on a single-role kernel.** Grounded in `prepare_h.py:166`, but that kernel is warp-spec; confirm in the single-role form. **Static fallback:** `T.serial(q_len)` with an `if t<L` predicate guarding decay+kS+update+store together, and the wrapper zero-fills `g` (decay=1) and `β` (rank-1=0) for `t≥L` (the `fused_fwd.py:406-444` masked-tail idiom).
 - **C. Exact nreg at `threads=256, block_DV=128`.** Compile + `set_max_nreg` tuning; confirm no spill.
 - **D. Head-batch per-band per-column scalar gather** (decay/β indexed by `band = j_v // blockV` inside one `T.Parallel(DK, gs·blockV)`). **No repo precedent** — existing per-column FMAs index by *row* (`g_exp_shared[j_s]`), uniform across columns. Trace-test that it lowers to a clean per-column broadcast, not a divergent branch. Blocks the head-batch variant if it lowers badly.
 - **E. Head-batch fused-downcast pass** (one `T.Parallel` writing both fp32 state and bf16 operand). If it won't compile, fall back to verifying a shared→shared downcast `T.copy` (also unproven).
 - **F. fp32-operand wgmma** (`kkt_solve.py:184` proves all-fp32 SMEM operands are legal, but only at 32×32 into a fragment — wgmma-at-scale unproven). Keep bf16 `h_op_shared` default; only elide it (recover ~64 KB) if a microbench shows fp32-A throughput holds. `gs4/bv128` stays hard-rejected regardless.
 - **G. Single-buffer enforcement:** factory must statically forbid q/k double-buffering on the occ=1 combos (`gs2/bv128`, `gs4/bv64`).
+- **H. Two-vector outer-product `T.Parallel` FMA** `h[i,j]+=k[i]·v_new[j]` — **not** grounded (`fused_fwd.py:197` is a *scalar*-broadcast FMA). The core rank-1 uses the grounded `transpose_A` gemm-into-fragment (`:204`) instead; this FMA is needed **only** for the head-batched SMEM-state case (where gemm can't accumulate into shared) and must be trace-tested to lower as a clean per-element FMA, not a broadcast-shape error.
 
 ---
 
@@ -269,4 +272,6 @@ Do **not** start the head-batched variant before the core is built and validated
 - GQA-group head-batching → **in scope now** (decided; §7).
 - Extreme `B=1, Hg≤2` TP → **accept V-split ~48% SM fill; caller batches / CUDA graphs** (decided). Not pursuing an `L=1`-only K-split path.
 
-**Still to confirm with the inference engine:** the `seqlens` contract (`[B]` int32, accepted length `1..q_len`).
+**Ragged contract (resolved by the SGLang grounding):** the **verify** path receives ragged lengths as **`cu_seqlens`/`query_start_loc [N+1]` with `B=1` flattened varlen** (a *different* CTA→request prologue than this spec's dense `[B] seqlens` — derive `bb`/per-request token ranges device-side à la `kkt_solve.py:245-247`, never `.item()`). The dense `[B] seqlens` form is for the standalone decode follow-on. See the verify spec (`2026-06-15-gdn-verify-sglang-design.md`).
+
+**Verify needs `D` up to 12** (chunk-12 draft), which **exceeds this spec's `1..8` design point** — re-derive `nreg` (§11.C) and the `M=1` gemm behavior (§11.A) at `D=12` with a compiled measurement; do not assume the `1..8` budget carries over (the state fragment is `D`-independent, but the per-token-state writes and the serial dependency chain are not).
