@@ -14,7 +14,7 @@ Extend FlashQLA to serve **SGLang speculative decoding** for GDN: a CUDA-graph-s
 **Resolved scope (do not relitigate):**
 - **Verify-first.** Build the shared infra (A) on top of the decode spine, then the verify kernel (B). Standalone single-token decode (C) is a follow-on; the verify engine already covers the multi-token recurrence.
 - **Build BOTH verify engines and benchmark at T=12** (decision): **V1** = recurrent multi-step (per-token states native); **V2** = chunk-based (fast `o`) + per-token-state extraction. Ship the faster on **total verify-step latency (`o` + per-token states)**. The repo-grounded analysis predicts V1 wins (see §5); V2 is built to confirm with data.
-- **Linear draft chain now**, clean seam for tree propagation (EAGLE `retrieve_parent_token` / your "DDTree") — **not** built.
+- **Linear draft chain only** — target scheme is **DFlash** (public upstream SGLang linear-chain speculative verify). Tree-structured propagation (DDTree) is **out of scope** (not needed); the linear design doesn't preclude adding it later.
 - **`allow_neg_eigval = False`** (decision): plain `β = sigmoid(b)`, exposed as a compile-time flag defaulting False.
 - **bf16 state pool** (your deployment; `SGLANG_MAMBA_SSM_DTYPE`), kernel dtype-agnostic.
 
@@ -144,7 +144,6 @@ All tensors caller-preallocated; `B=1` outer dim, `N` requests flattened.
 | `intermediate_states_buffer` | `[num_cache_slots, cache_steps≥T, 32, 128, 128]` | SSM dtype | **same V-major layout as pool** |
 | `intermediate_state_indices` | `[N]` | int32 | slot into ibuf, decoupled; `<0 ⇒ skip` |
 | `cu_seqlens` (`query_start_loc`) | `[N+1]` | int32 | ragged; in-kernel load only |
-| `retrieve_parent_token` | — | — | DDTree seam; asserted `None` (linear chain) ⇒ tree branch compiled out |
 
 **Capture rules:** zero host sync (never `prepare_chunk_offsets`/`prepare_chunk_indices`; for V2 precompute trivial single-chunk offsets pre-capture and bypass the varlen branch); zero `torch.empty`; static shapes (`block_DV` from the MPC ladder, `T=12` fixed); host gating hoisted outside capture.
 
@@ -171,7 +170,6 @@ fused_recurrent_gdr_verify_fwd(
     use_qk_l2norm_in_kernel=False, # False in primary path (host l2norm)
     state_v_first=True,            # SGLang interop default
     allow_neg_eigval=False,        # decision; flag exposed
-    retrieve_parent_token=None,    # DDTree seam, asserted None
 ) -> o                              # pool written in-place ONLY if not disable_state_update
 ```
 **JIT factory keys:** `tilelang_fused_recurrent_gdr_verify(H, Hg, DK=128, DV=128, scale, *_dtype, use_initial_state, disable_state_update, store_intermediate, is_varlen, use_qk_l2norm_in_kernel, state_v_first, allow_neg_eigval, fuse_gating, head_batch=False, group_size=1, block_DV=128, threads=256)`. `N`, `num_tokens` are `T.dynamic`; `D` fixed per capture. Kernel name ends `*_kernel_kernel` (CLAUDE.md).
@@ -181,7 +179,7 @@ fused_recurrent_gdr_verify_fwd(
 recurrent_gated_delta_rule_verify(
     A_log, a, dt_bias, q, k, v, b, ssm_states, cache_indices, query_start_loc,
     intermediate_states_buffer, intermediate_state_indices, cache_steps,
-    retrieve_parent_token=None, scale=None, use_qk_l2norm_in_kernel=True, disable_state_update=True)
+    scale=None, use_qk_l2norm_in_kernel=True, disable_state_update=True)
 # asserts K==V==128, H%Hg==0, q.dtype!=fp32; derives state_v_first from ssm_states.stride()/shape;
 # host-side l2norm+gating (primary); host block_DV via MPC ladder; no autograd.
 ```
@@ -214,12 +212,12 @@ recurrent_gated_delta_rule_verify(
 
 ## 10. Confirm with the user / deployment
 
-1. **"DDTree"** has zero upstream-SGLang hits (likely your codename). `DFlash` and EAGLE `retrieve_parent_token`/`retrieve_next_sibling` **are** public upstream. Confirm what DDTree maps to so the linear-chain seam targets the right contract.
-2. **`SGLANG_MAMBA_SSM_DTYPE`** — you stated bf16; upstream default is `None ⇒ fp32`. Load-bearing for the perf model (per-token writes double under fp32). Confirm the live pool dtype.
-3. **`intermediate_states_buffer` exact shape/leading dim** — is the leading dim `num_slots` or `num_slots+1` (SGLang sentinel)? Is `shape[1]` exactly `draft_token_num=12` or a padded max (`--speculative-adaptive`)? Re-derive V-major from `stride(2)/stride(3)` of the **live** allocation (docstrings are stale). Wrapper asserts `cache_steps ≥ T`.
-4. **`allow_neg_eigval`** — confirmed **False** (plain `sigmoid(b)`); flag exposed, defaults False.
-5. **Slot sentinel** — confirm `slot < 0 ⇒ skip` (SGLang verify), **not** `slot ≤ 0 / NULL_BLOCK_ID=0` (vLLM) — a 0-vs-(-1) mismatch silently corrupts pool slot 0.
-6. **FlashInfer numerics** — for SM90/Hopper the Triton fp32-accum path runs; confirm whether bit-matching the FlashInfer SM100 bf16-state adapter is a requirement.
+1. **`SGLANG_MAMBA_SSM_DTYPE`** — you stated bf16; upstream default is `None ⇒ fp32`. Load-bearing for the perf model (per-token writes double under fp32). Confirm the live pool dtype.
+2. **`intermediate_states_buffer` exact shape/leading dim** — is the leading dim `num_slots` or `num_slots+1` (SGLang sentinel)? Is `shape[1]` exactly `draft_token_num=12` or a padded max (`--speculative-adaptive`)? Re-derive V-major from `stride(2)/stride(3)` of the **live** allocation (docstrings are stale). Wrapper asserts `cache_steps ≥ T`.
+3. **`allow_neg_eigval`** — confirmed **False** (plain `sigmoid(b)`); flag exposed, defaults False.
+4. **Slot sentinel** — confirm `slot < 0 ⇒ skip` (SGLang verify), **not** `slot ≤ 0 / NULL_BLOCK_ID=0` (vLLM) — a 0-vs-(-1) mismatch silently corrupts pool slot 0.
+5. **FlashInfer numerics** — for SM90/Hopper the Triton fp32-accum path runs; confirm whether bit-matching the FlashInfer SM100 bf16-state adapter is a requirement.
+6. **DFlash verify-entry parity** — DFlash (`speculative/dflash_*`, public upstream) is the confirmed target. Reconcile `recurrent_gated_delta_rule_verify`'s exact arg order / buffer names against DFlash's actual GDN verify call so it's drop-in; tree-only params (e.g. `retrieve_parent_token`) are dropped since the linear chain doesn't use them.
 
 ---
 
@@ -232,4 +230,4 @@ recurrent_gated_delta_rule_verify(
 5. **Verify V2** (chunk-`o` + the honest extraction scan) — only after §9.7 budget check.
 6. **Benchmark-to-decide** (§5) → ship the winner; the other stays documented.
 7. **In-kernel gating** fast-follow if §9.4 passes.
-8. **(Optional) standalone decode (C)** and the **tree seam (#8)** — later.
+8. **(Optional) standalone decode (C)** — later. (Tree-structured propagation is **out of scope** — not needed; the linear-chain design doesn't preclude adding it later.)
