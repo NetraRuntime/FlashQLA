@@ -36,6 +36,7 @@ def recurrent_gated_delta_rule(
     use_qk_l2norm_in_kernel=False,
     seqlens=None,
     head_first=False,
+    head_batch=None,
 ):
     assert q.dtype == k.dtype == v.dtype and q.dtype != torch.float32
     assert not head_first, "head_first=True is not supported."
@@ -55,6 +56,7 @@ def recurrent_gated_delta_rule(
         initial_state=initial_state,
         output_final_state=output_final_state,
         seqlens=seqlens,
+        head_batch=head_batch,
     )
     return o.to(q.dtype), final_state
 

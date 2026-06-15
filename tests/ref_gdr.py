@@ -711,11 +711,16 @@ def decode_recur(
     seqlens=None,  # [B] int32 accepted lengths (default: all T)
     read_pre_update=False,  # NEGATIVE CONTROL: read o before the rank-1 (wrong)
     gqa_mod=False,  # NEGATIVE CONTROL: hg = h % Hk (wrong GQA mapping)
+    band_perm=False,  # NEGATIVE CONTROL: cyclically swap V-heads WITHIN each GQA group (wrong)
 ):
     """Ground-truth GDN decode recurrence (spec 2): per (b,h), per token t<L_b:
     S*=exp(g); kS=k@S; v_new=beta*(v-kS); S+=outer(k,v_new); o=scale*(q@S).
-    The read_pre_update / gqa_mod flags intentionally compute the WRONG result for
-    negative-control tests (the kernel must match the default and differ from these)."""
+    The read_pre_update / gqa_mod / band_perm flags intentionally compute the WRONG result
+    for negative-control tests (the kernel must match the default and differ from these).
+    band_perm targets the head-batched kernel specifically: gqa_mod only re-routes the K/Q
+    SOURCE head and is blind to a swap of two V-heads that share an hg, whereas band_perm
+    cyclically permutes the grp V-heads within each group -- exactly the head-batch row->band
+    mis-mapping bug. (Use a per-head DISTINCT gate so the permuted result is far from correct.)"""
     B, T, Hk, K = k.shape
     _, _, Hv, V = v.shape
     assert K == V == 128 and Hv % Hk == 0
@@ -748,6 +753,13 @@ def decode_recur(
                 S[b, h] = Sh
                 if not read_pre_update:
                     o[b, t, h] = scale * (qt @ Sh)  # [V] (post-update, correct)
+    if band_perm and grp > 1:  # cyclic within-group head swap -> wrong (head-batch band control)
+        perm = torch.arange(Hv, device=dev)
+        for hgi in range(Hk):
+            base = hgi * grp
+            perm[base : base + grp] = base + (torch.arange(grp, device=dev) + 1) % grp
+        o = o[:, :, perm, :].contiguous()
+        S = S[:, perm, :, :].contiguous()
     return o, S  # o:[B,T,Hv,V] (only [:, :L_b] valid per b), final_state S:[B,Hv,K,V]
 
 
