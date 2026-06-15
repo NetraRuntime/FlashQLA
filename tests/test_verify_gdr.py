@@ -108,6 +108,41 @@ def test_verify_wrapper_gating():
 
 
 @CUDA
+@pytest.mark.parametrize("Hk,Hv", [(8, 8), (2, 8)])
+def test_verify_in_kernel_gating(Hk, Hv):
+    # in-kernel g/beta/l2norm must match the host-gating reference on the same raw inputs
+    from flash_qla.ops.gated_delta_rule.fused_recurrent import gdn_sigmoid_gate
+    from flash_qla.ops.gated_delta_rule.fused_recurrent.hopper.fused_recurrent_verify import (
+        fused_recurrent_gdr_verify_gated_fwd,
+    )
+
+    N, D = 4, 4
+    total = N * D
+    torch.manual_seed(2)
+    q = torch.randn(1, total, Hk, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, total, Hk, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, total, Hv, 128, device="cuda", dtype=torch.bfloat16)
+    a = torch.randn(1, total, Hv, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(1, total, Hv, device="cuda", dtype=torch.bfloat16)
+    A_log = torch.randn(Hv, device="cuda").abs().log()
+    dt_bias = torch.randn(Hv, device="cuda")
+    pool = torch.randn(N, Hv, 128, 128, device="cuda", dtype=torch.bfloat16)
+    cu = torch.arange(0, total + 1, D, dtype=torch.int32, device="cuda")
+    si = torch.arange(N, dtype=torch.int32, device="cuda")
+    ci = torch.arange(N, dtype=torch.int32, device="cuda")
+    ibuf = torch.zeros(N + 1, D, Hv, 128, 128, device="cuda", dtype=torch.bfloat16)
+    o = torch.empty(1, total, Hv, 128, device="cuda", dtype=torch.bfloat16)
+
+    g_ref, beta_ref = gdn_sigmoid_gate(A_log, a, dt_bias, b)
+    o_ref, _, ibuf_ref = verify_ref(
+        l2norm(q), l2norm(k), v, g_ref, beta_ref, pool, si, cu, ibuf, ci, disable_state_update=True)
+    fused_recurrent_gdr_verify_gated_fwd(
+        q, k, v, a, b, A_log, dt_bias, pool, si, cu, ibuf, ci, o, disable_state_update=True)
+    assert _rel(o, o_ref) <= 0.03
+    assert _rel(ibuf, ibuf_ref) <= 0.03
+
+
+@CUDA
 def test_verify_cuda_graph():
     # the low-level entry must be CUDA-graph capturable (no host sync / no alloc) and replay correctly
     N, D, H = 4, 4, 8
