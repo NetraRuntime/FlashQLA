@@ -4,7 +4,7 @@ Date: 2026-06-15
 Status: Design approved in principle (pending written-spec review)
 Scope: Forward/inference-only fused **recurrent** (decode) kernel for Gated Delta Rule (GDN), to sit beside the existing chunked-prefill kernels in FlashQLA.
 
-> **IMPLEMENTATION STATUS (2026-06-15, validated on a Modal H100).** The core decode kernel is **built and passing** (19 tests). It is **gemm-free** rather than the `gemm_v1`-based design in §3: the GEMVs are `T.reduce_sum` over K and the rank-1 is a `T.Parallel` outer product, state `[block_DV, DK]` fp32 (Gate 1 — `gemm_v1` needs M%16==0 *and* num_warps≤N/16 — is unworkable for single-token GEMVs at small `block_DV`; gemm-free is simpler, fp32-accurate, and hit no warp-partition/layout walls). The §11 gate outcomes on H100: M=1 gemm **fails** (gemm-free moots it); `T.serial(L)` and the V-first transpose store **work**; TileLang `log2/rsqrt/exp` **lower** (so in-kernel gating is feasible, used by the verify kernel). The head-batched variant (§7) is **not built** — V-split alone reaches 60–67% of peak HBM in the server regime (see the verify spec). See `2026-06-15-gdn-verify-sglang-design.md` for the SGLang verify build that reuses this spine.
+> **IMPLEMENTATION STATUS (2026-06-15, validated on a Modal H100).** The core decode kernel is **built and passing** (19 tests). It is **gemm-free** rather than the `gemm_v1`-based design in §3: the GEMVs are `T.reduce_sum` over K and the rank-1 is a `T.Parallel` outer product, state `[block_DV, DK]` fp32 (Gate 1 — `gemm_v1` needs M%16==0 *and* num_warps≤N/16 — is unworkable for single-token GEMVs at small `block_DV`; gemm-free is simpler, fp32-accurate, and hit no warp-partition/layout walls). The §11 gate outcomes on H100: M=1 gemm **fails** (gemm-free moots it); `T.serial(L)` and the V-first transpose store **work**; TileLang `log2/rsqrt/exp` **lower** (so in-kernel gating is feasible, used by the verify kernel). The head-batched variant (§7) is **not built**, and V2 (chunk-based verify) is **not built**. As-built occupancy tile (autotuned, supersedes §5's `{128,64,32}` ladder): **`block_DV=64 @ threads=128`** when `B·H·2 ≥ 0.7·SM`, else `block_DV=32` — `block_DV=128` is occupancy-starved and dropped. **Large-batch perf is compute-bound**, not bandwidth-bound: the per-token state writes are only ~+21% over a no-write floor, so the kernel is at parity with FLA at large batch (the shared recurrence-compute limit) and ~3.3× faster only in the latency-bound regime. See `2026-06-15-gdn-verify-sglang-design.md` for the SGLang verify build that reuses this spine, the FLA benchmark, and the full optimization investigation.
 
 ---
 
@@ -57,6 +57,8 @@ This matches the GDN recurrence in the FlashQLA blog (`S = αS(I − βkkᵀ) + 
 ---
 
 ## 3. Core kernel architecture (`gs = 1`) — build this first
+
+> **AS-BUILT NOTE:** the shipped kernel is **gemm-free** — the `gemm_v1` K-contractions described below were replaced by `T.reduce_sum` over K (for `kS`/`o`) and a `T.Parallel` outer product (for the rank-1), because Gate 1 (§11.A) showed `gemm_v1` needs `M%16==0` *and* `num_warps ≤ N/16`, unworkable for single-token GEMVs at small `block_DV`. The recurrence math, step ordering, and V-split below are unchanged; only the contraction *mechanism* differs. This section is kept as the design rationale that motivated the pivot.
 
 Single-role, memory-bound kernel. **Not** the chunk kernel's 512-thread / 4-warpgroup warp-specialization (that is for a compute-bound chunk pipeline; decode is a serial recurrence on resident state).
 
@@ -121,6 +123,8 @@ else:                                block_DV = 32        # 4 CTAs / head
 ---
 
 ## 7. Head-batched GQA variant (server regime) — build after the core
+
+> **AS-BUILT NOTE: NOT built.** The benchmark showed the shipped per-head V-split is already at parity with FLA at large batch (the shared compute-bound limit — see the verify spec), so the head-batched variant has no headroom to win and was intentionally skipped (YAGNI). This section is retained as the design that was considered. Note also: with the gemm-free pivot (§3), the "one wide-N gemm" framing below would instead be a wider `T.reduce_sum`/`T.Parallel` over the grouped V-band.
 
 A compile-time **specialization of the same jit factory** (keys `head_batch: bool`, `group_size: int`, alongside `block_DV`), not a separate kernel — matching how the chunk factory branches its prim_func on `is_varlen` / `is_cp` / `block_DV`. `head_batch=False` traces the core V-split body unchanged.
 
@@ -240,6 +244,8 @@ Add `benchmark/bench_recurrent_gdr.py` mirroring `bench_gated_delta_rule.py`. Ba
 ---
 
 ## 11. Open feasibility items (prototype-gated; do not block the architecture)
+
+> **AS-BUILT NOTE: all gates RESOLVED on H100 (workspace `netragratis`).** Outcomes: **A.** `gemm_v1` at `M=1` **fails** ("M must be divisible by 16") and even M-padded forms hit warp-partition / single-row-fragment walls → **moot**, the kernel pivoted to gemm-free (§3). **B.** single-role `T.serial(runtime L)` is **usable** as-is (no static fallback needed). **C.** moot under gemm-free; final tile is `block_DV=64 @ threads=128`, no spill. **D./E.** moot — head-batch not built (§7). **F.** moot — no wgmma in the gemm-free path; state stays fp32 in-register. **Bonus:** in-kernel fused gating is feasible (`log/log1p/rsqrt/sqrt/sigmoid/exp2` all lower on SM90 — §6's host-only assumption was over-cautious). The items below are the pre-build gates as originally written.
 
 These pick between grounded fallbacks; the architecture holds regardless.
 

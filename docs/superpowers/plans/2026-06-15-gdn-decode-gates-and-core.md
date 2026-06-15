@@ -1,5 +1,12 @@
 # GDN Decode — Feasibility Gates + Core Kernel Implementation Plan
 
+> **AS-BUILT NOTE (kept as the historical implementation plan).** This plan was executed, but the architecture below was **pivoted during gate validation** and the as-built kernel differs:
+> - **gemm-free, not `gemm_v1`.** Gate 1 found `gemm_v1` at `M=1` fails ("M must be divisible by 16") with no workable padding (warp-partition + single-row-fragment walls). The three K-contractions became `T.reduce_sum` over K (`kS`/`o`) + a `T.Parallel` outer product (rank-1); state stays fp32 in a `[block_DV, DK]` register fragment.
+> - **`threads=128`, not `threads=256`.** Autotuned tile is `block_DV=64 @ threads=128` (fall to `32` for the low-CTA tail) — the `threads=256, block_DV=128` config was occupancy-starved.
+> - **Gates all resolved; in-kernel fused gating shipped** (it proved feasible, contrary to the host-only assumption). Verify (V1, SGLang DFlash) was built on this spine; V2 and the head-batched variant were intentionally not built. 34 tests pass on H100; shipped as `NetraRuntime/FlashQLA` PR #1.
+>
+> See the two specs' STATUS notes for the full as-built record. The task-by-task structure below is preserved for provenance, not as current build instructions.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Prove the four hardware feasibility gates, then build and validate the single-role recurrent GDN **core decode kernel** (`gs=1`) — the spine every later phase (infra A, verify V1/V2) reuses.
