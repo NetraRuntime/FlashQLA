@@ -17,6 +17,7 @@ Extend FlashQLA to serve **SGLang speculative decoding** for GDN: a CUDA-graph-s
 - **Linear draft chain only** — target scheme is **DFlash** (public upstream SGLang linear-chain speculative verify). Tree-structured propagation (DDTree) is **out of scope** (not needed); the linear design doesn't preclude adding it later.
 - **`allow_neg_eigval = False`** (decision): plain `β = sigmoid(b)`, exposed as a compile-time flag defaulting False.
 - **bf16 state pool** (your deployment; `SGLANG_MAMBA_SSM_DTYPE`), kernel dtype-agnostic.
+- **Scope boundary.** This kernel owns **only the GDN SSM recurrent state**. The conv state (`causal_conv1d_update` — tree-conv + `intermediate_conv_window`) runs **upstream in SGLang** (`gdn_backend.forward_extend`), before this kernel — it is **not** this kernel's responsibility. The author owes no conv-state handling.
 
 **The root gate for everything** is decode-spec §11.A: `gemm_v1` at `M=1` (each step is one token). Prove it on the Hopper box before any verify work; fallback is M-pad-to-16.
 
@@ -42,7 +43,7 @@ if not disable_state_update:
         with T.Then():
             T.copy(h_fragment, pool[slot, bh, <state-slice>])   # fp32 → bf16 scatter
 ```
-**Clear-then-conditional-overwrite** (there is no `T.If/T.Else` in the repo). **Sentinel `slot < 0 ⇒ skip`** (SGLang verify convention) — **not** vLLM's `slot ≤ 0 / NULL_BLOCK_ID=0`; the wrapper asserts this to prevent slot-0 corruption (confirm §10.5).
+**Clear-then-conditional-overwrite** (there is no `T.If/T.Else` in the repo). **Only `state_indices` carries the `-1` sentinel** (`PAD_SLOT_ID = -1`; `slot < 0 ⇒ skip`, slot 0 is valid — **not** vLLM's `slot ≤ 0 / NULL_BLOCK_ID=0`); guard with `slot >= 0` (resolved §10.4). **`intermediate_state_indices` is dense (`arange`, never `-1`)** — so the per-token ibuf write (§3) must be gated by the **pool-slot mask `state_indices[bb] >= 0`**, reusing the same `slot` var, **not** by `intermediate_state_indices`. (A `T.If(cache_slot >= 0)` guard would never fire — `cache_slot` is always valid — and would leave garbage in padded ibuf rows.)
 
 ### A2 — Configurable-dtype pool + fp32-register accumulation (GROUNDED, ship)
 fp32 master `h_fragment = alloc_fragment((128, block_DV), "float32")`. **Exactly three cast points:** (a) bf16→fp32 on the gather; (b) fp32→bf16 on the per-step gemm-operand staging copy (`fused_fwd.py:190`); (c) fp32→bf16 on intermediate/final stores. The cancellation-critical `v_new = β·(v − kS)` subtract stays **fp32** before any downcast. Pool dtype is a factory key driven by the caller's pool tensor dtype (your deployment: bf16). Under fp32 pools the per-token-write traffic doubles (~832 KB/head vs ~416 KB/head) — a caller decision, not a code risk.
@@ -53,17 +54,17 @@ Three rules for the captured call:
 2. **No allocation.** Every buffer (`o`, pool, intermediate buffer, all index tensors) is **caller-preallocated**; `out_idx` stays commented (`fused_fwd.py:16`) so outputs are positional. The graph-safe wrapper does **zero** `torch.empty` (vs `fused_gdr_fwd:561-600`).
 3. **Static shapes.** `block_DV` from the `MULTI_PROCESSOR_COUNT*0.7` ladder (`fused_fwd.py:602-608`) using only static `N·H`; `grid = ceildiv(DV,block_DV)·N·H`; `T=12` fixed per graph; `cache_steps` read from `intermediate_states_buffer.shape[1]` as a python int (capture-constant), **not** the runtime `cache_steps` arg (SGLang ignores it).
 
-Host-side gating (A5) is hoisted **outside** the captured region.
+**"Host-side" means PyTorch, not TileLang — NOT outside capture.** The gating + l2norm (A5) depend on per-step `a, b, q, k`, so they are PyTorch ops that run **inside** SGLang's captured graph; they are capture-safe (pure elementwise, no `.item()`, no new allocation, static shape) and must **not** be lifted out of the per-step graph.
 
 ### A4 — State layout: `state_v_first = True` is the SGLang contract (GROUNDED, default flipped)
 SGLang's pool **and** intermediate buffer are **V-major `[.,H,V,K]`** — established from pointer **arithmetic** (`o_v*K + o_k`; `make_block_ptr (V,K),(K,1)`; `temporal_state_shape=(HV, head_dim=V, state_size=K)`), **not** docstrings (which are stale and mutually contradictory). FlashQLA-native is K-major `[.,H,K,V]` (`fused_fwd.py:70`). `state_v_first` is a compile-time key tracing to a different prim_func body (like `is_varlen`/`is_cp`); **no runtime transpose** (incompatible with paging). It applies to **both** the pool and the intermediate buffer (the scheduler reads the buffer back; a wrong major-order silently restores a transposed state). The wrapper derives it authoritatively from `pool.stride()/shape`.
 
-**Critical test consequence:** because `K==V==128`, a layout error is **numerically silent** in any equal-dim test. The hard validation gate is a **per-head-distinct-gate bit-identity** test vs the FLA reference (§9), never a shape/equal-value test. Whether `T.copy` from a `[K, block_DV]` fp32 fragment into a `[V,K]`-declared slice emits a strided TMA store without an SMEM transpose stage is **prototype-gated** (§10 Gate 6) — validate on a non-square probe (`DK≠DV`) or byte-compare with FLA, never the `128==128` test.
+**Critical test consequence:** because `K==V==128`, a layout error is **numerically silent** in any equal-dim test. The hard validation gate is a **per-head-distinct-gate bit-identity** test vs the FLA reference (§8), never a shape/equal-value test. Whether `T.copy` from a `[K, block_DV]` fp32 fragment into a `[V,K]`-declared slice emits a strided TMA store without an SMEM transpose stage is **prototype-gated** (§9 Gate 6) — validate on a non-square probe (`DK≠DV`) or byte-compare with FLA, never the `128==128` test.
 
 ### A5 — Gating: host-side primary, in-kernel prototype-gated
-The repo's TileLang uses **only `T.exp2`** (grep: zero `log`/`log2`/`log1p`/`rsqrt`/`sqrt`/`sigmoid`/`exp`). In-kernel `softplus` needs `log1p`; in-kernel l2norm needs `rsqrt` — **neither is grounded**, and the decode spec already decided host-side l2norm. The Gate-4 probe (`hasattr(T,'log2'/'rsqrt')` + an SM90 lower test) could not run here (no TileLang locally) — it **must run on the Hopper box** (§10 Gate 4).
+The repo's TileLang uses **only `T.exp2`** (grep: zero `log`/`log2`/`log1p`/`rsqrt`/`sqrt`/`sigmoid`/`exp`). In-kernel `softplus` needs `log1p`; in-kernel l2norm needs `rsqrt` — **neither is grounded**, and the decode spec already decided host-side l2norm. The Gate-4 probe (`hasattr(T,'log2'/'rsqrt')` + an SM90 lower test) could not run here (no TileLang locally) — it **must run on the Hopper box** (§9 Gate 4).
 
-- **Primary (capture-safe, ships):** compute `g`, `β`, and qk-l2norm **host-side** in PyTorch (a tiny `[1, N·T, H]` elementwise op + l2norm, hoisted outside capture), pass **pre-activated `g` (log-decay) and `β` (post-sigmoid)** into the kernel — exactly what SGLang's `_update` kernel and FlashQLA's chunk path already consume. Only the per-step decay `exp2(g·1.442695)` is in-kernel (pure `exp2`, grounded).
+- **Primary (capture-safe, ships):** compute `g`, `β`, and qk-l2norm in **PyTorch (not TileLang)** — a tiny `[1, N·T, H]` elementwise op + l2norm that runs **inside** SGLang's captured graph (capture-safe), passing **pre-activated `g` (log-decay) and `β` (post-sigmoid)** into the kernel — exactly what SGLang's `_update` kernel and FlashQLA's chunk path already consume. Only the per-step decay `exp2(g·1.442695)` is in-kernel (pure `exp2`, grounded).
 - **In-kernel fusion (req #5, fast-follow):** accept raw `(A_log, dt_bias, a, b)` and compute `g`/`β`/l2norm in-kernel — **only if** Gate 4 confirms `log2`/`rsqrt` lower on SM90. `sigmoid` and the decay `exp2` are pure-`exp2` (groundable); `softplus`/l2norm-`rsqrt` are the blockers.
 
 ### Exact gating math (grounded — identical across vLLM / SGLang / FLA)
@@ -86,17 +87,17 @@ Reference-fixture init (for tests): `A ~ U(0,16)`, `A_log = log(A)`; `dt = exp(U
 **Per-token intermediates (req #6) — the free V1 win (GROUNDED).** The serial loop already holds the full post-update fp32 `S` in `h_fragment` at the end of every token (step ordering: decay → stage → `kS` → `v_new`(fp32) → rank-1 → **write state** → `o`). The write:
 ```
 if store_intermediate:
-    with T.If(cache_slot >= 0):
+    with T.If(slot >= 0):                                            # gate on the POOL slot mask
         with T.Then():
             T.copy(h_fragment, ibuf[cache_slot, t, bh, <state-slice>])   # fp32 → bf16
 ```
-`cache_slot = intermediate_state_indices[bb]` (decoupled from `state_indices`); `ibuf = intermediate_states_buffer [num_cache_slots, cache_steps≥T, H, V, K]` (V-major). This is `fused_fwd.py:471-481` with `batch_idx → cache_slot` (paged) and `chunk_start_idx+i_s → token t`. Cost: +1 bf16 `[128,block_DV]` store/token; ~`12·32KB = 384 KB/head` of writes dominate (~92% of state traffic) — **inherent to req #6, the workload, not overhead.**
+`cache_slot = intermediate_state_indices[bb]` is the **destination** index (decoupled from `state_indices`); it is dense (`arange`, never `-1`), so the write is gated by the **pool-slot mask `slot = state_indices[bb] >= 0`** — the real-request mask — reusing A1's `slot` var. (Guarding on `cache_slot >= 0` would never fire and would write garbage into padded ibuf rows; harmless only because the scheduler reads `ibuf[slot, :k_accepted]` for real requests, but we skip those writes anyway.) `ibuf = intermediate_states_buffer [num_slots+1, cache_steps=12, H, V, K]` (V-major, single-layer slice — see §6). This is `fused_fwd.py:471-481` with `batch_idx → cache_slot` (paged) and `chunk_start_idx+i_s → token t`. Cost: +1 bf16 `[128,block_DV]` store/token; ~`12·32KB = 384 KB/head` of writes dominate (~92% of state traffic) — **inherent to req #6, the workload, not overhead.**
 
 **No-commit (req #7) — free (GROUNDED).** The spine's only pool write is the optional post-loop scatter (A1), gated by `not disable_state_update`. Verify passes `disable_state_update=True` and that `T.copy` is dead-code-eliminated. The scheduler later copies `ibuf[cache_slot, k_accepted]` into the live pool slot.
 
 **Gating** host-side primary (A5). Decay `exp2(g·1.442695)` per step (raw g).
 
-**`D=12` caveat.** Chunk-12 verify needs `D=12`, above the decode spine's `1..8` design point — re-derive `nreg` (§10 Gate 3) and the `M=1` gemm behavior at `D=12` with a compiled measurement.
+**`D=12` caveat.** Chunk-12 verify needs `D=12`, above the decode spine's `1..8` design point — re-derive `nreg` (§9 Gate 3) and the `M=1` gemm behavior at `D=12` with a compiled measurement.
 
 **Varlen prologue (real kernel change).** SGLang passes `cu_seqlens = query_start_loc [N+1]` with `B=1` flattened; the CTA→request map (`bb` from a flattened token layout) is a **different prologue** than the dense `bb = bbh//H` (`fused_fwd.py:92`) — derive `bb` / per-request token ranges device-side (`kkt_solve.py:245-247`), no `.item()`. Re-verify the capture-safe index math.
 
@@ -141,11 +142,11 @@ All tensors caller-preallocated; `B=1` outer dim, `N` requests flattened.
 | `A_log`, `dt_bias` | `[32]` | fp32 | unused in host-gating baseline |
 | `pool` (`ssm_states`) | `[num_slots, 32, 128, 128]` | SSM dtype (bf16) | **V-major** (`state_v_first=True`), K stride-1 |
 | `state_indices` (`cache_indices`) | `[N]` | int32 | slot/request; `<0 ⇒ skip` gather AND scatter |
-| `intermediate_states_buffer` | `[num_cache_slots, cache_steps≥T, 32, 128, 128]` | SSM dtype | **same V-major layout as pool** |
-| `intermediate_state_indices` | `[N]` | int32 | slot into ibuf, decoupled; `<0 ⇒ skip` |
+| `intermediate_states_buffer` | `[num_slots+1, 12, 32, 128, 128]` | SSM dtype | single-layer slice of `[num_layers, num_slots+1, draft_token_num=12, HV, V, K]`; **same V-major layout as pool**; `num_cache_slots = num_slots+1`; `cache_steps = 12` exact (non-adaptive) |
+| `intermediate_state_indices` | `[N]` | int32 | destination slot into ibuf; **dense `arange`, never `-1`** — the ibuf write is gated by the **pool-slot mask** (`state_indices[b] ≥ 0`), not this index |
 | `cu_seqlens` (`query_start_loc`) | `[N+1]` | int32 | ragged; in-kernel load only |
 
-**Capture rules:** zero host sync (never `prepare_chunk_offsets`/`prepare_chunk_indices`; for V2 precompute trivial single-chunk offsets pre-capture and bypass the varlen branch); zero `torch.empty`; static shapes (`block_DV` from the MPC ladder, `T=12` fixed); host gating hoisted outside capture.
+**Capture rules:** zero host sync (never `prepare_chunk_offsets`/`prepare_chunk_indices`; for V2 precompute trivial single-chunk offsets pre-capture and bypass the varlen branch); zero `torch.empty`; static shapes (`block_DV` from the MPC ladder, `T=12` fixed); the PyTorch gating/l2norm runs **inside** capture (capture-safe elementwise — A5), not in the TileLang kernel and **not** lifted out of the graph.
 
 **No-commit:** `disable_state_update=True` ⇒ final pool scatter dead-code-eliminated; only `o` + ibuf produced. Decode follow-on sets it False and commits.
 
@@ -160,10 +161,10 @@ All tensors caller-preallocated; `B=1` outer dim, `N` requests flattened.
 fused_recurrent_gdr_verify_fwd(
     q, k, v,                       # bf16 (raw gate path: + a, b bf16 [1,N·T,32]; A_log, dt_bias fp32 [32])
     pool,                          # [num_slots, 32, 128, 128] V-major; SSM dtype
-    state_indices,                 # int32 [N]; <0 => skip
+    state_indices,                 # int32 [N]; -1 (PAD_SLOT_ID) => skip; slot 0 valid
     o,                             # CALLER-PREALLOC bf16 [1, N·T, 32, 128]
-    intermediate_states_buffer,    # CALLER-PREALLOC [num_cache_slots, cache_steps>=T, 32, 128, 128] V-major
-    intermediate_state_indices,    # int32 [N]; <0 => skip caching
+    intermediate_states_buffer,    # CALLER-PREALLOC [num_slots+1, 12, 32, 128, 128] V-major (single-layer slice)
+    intermediate_state_indices,    # int32 [N]; dense arange (never -1); ibuf write gated by state_indices>=0
     cu_seqlens,                    # int32 [N+1]; per-CTA loop bound; in-kernel load only
     scale=None,                    # default 128**-0.5
     disable_state_update=True,     # NO-COMMIT (verify)
@@ -174,14 +175,16 @@ fused_recurrent_gdr_verify_fwd(
 ```
 **JIT factory keys:** `tilelang_fused_recurrent_gdr_verify(H, Hg, DK=128, DV=128, scale, *_dtype, use_initial_state, disable_state_update, store_intermediate, is_varlen, use_qk_l2norm_in_kernel, state_v_first, allow_neg_eigval, fuse_gating, head_batch=False, group_size=1, block_DV=128, threads=256)`. `N`, `num_tokens` are `T.dynamic`; `D` fixed per capture. Kernel name ends `*_kernel_kernel` (CLAUDE.md).
 
-**High-level wrapper** (mirrors SGLang `target_verify`; allocates outside capture):
+**High-level wrapper** (drop-in for SGLang's DFlash `target_verify`; capture-safe PyTorch gating + dispatch, no allocation in the captured path):
 ```python
 recurrent_gated_delta_rule_verify(
     A_log, a, dt_bias, q, k, v, b, ssm_states, cache_indices, query_start_loc,
     intermediate_states_buffer, intermediate_state_indices, cache_steps,
+    retrieve_parent_token=None,    # accepted-and-IGNORED: DFlash is width-1 (TOPK=1); tree tensors are zeros
     scale=None, use_qk_l2norm_in_kernel=True, disable_state_update=True)
 # asserts K==V==128, H%Hg==0, q.dtype!=fp32; derives state_v_first from ssm_states.stride()/shape;
-# host-side l2norm+gating (primary); host block_DV via MPC ladder; no autograd.
+# PyTorch l2norm+gating (primary, capture-safe — inside the graph, not the TileLang kernel);
+# host block_DV via MPC ladder; no autograd. Confirm arg order vs DFlash's actual call (§10.6).
 ```
 **V2 entry (only if benchmark-selected):** `tilelang_fused_chunk_gdr_verify_fwd(..., commit_final_state=False, store_intermediate=True, state_v_first=True, fuse_gate, ...)` with an explicit per-token extraction scan sub-kernel carrying raw `v,k,β,g`; static precomputed `chunk_offsets=arange(N+1)`/`chunk_indices=[[n,0]]`; bypasses `prepare_chunk_offsets`.
 
@@ -210,14 +213,18 @@ recurrent_gated_delta_rule_verify(
 
 ---
 
-## 10. Confirm with the user / deployment
+## 10. Deployment facts (resolved against the live fork) + residual confirms
 
-1. **`SGLANG_MAMBA_SSM_DTYPE`** — you stated bf16; upstream default is `None ⇒ fp32`. Load-bearing for the perf model (per-token writes double under fp32). Confirm the live pool dtype.
-2. **`intermediate_states_buffer` exact shape/leading dim** — is the leading dim `num_slots` or `num_slots+1` (SGLang sentinel)? Is `shape[1]` exactly `draft_token_num=12` or a padded max (`--speculative-adaptive`)? Re-derive V-major from `stride(2)/stride(3)` of the **live** allocation (docstrings are stale). Wrapper asserts `cache_steps ≥ T`.
-3. **`allow_neg_eigval`** — confirmed **False** (plain `sigmoid(b)`); flag exposed, defaults False.
-4. **Slot sentinel** — confirm `slot < 0 ⇒ skip` (SGLang verify), **not** `slot ≤ 0 / NULL_BLOCK_ID=0` (vLLM) — a 0-vs-(-1) mismatch silently corrupts pool slot 0.
+**RESOLVED (build to these):**
+1. **`SGLANG_MAMBA_SSM_DTYPE` = bf16** — confirmed (the pool is bf16). Kernel stays dtype-agnostic; the fp32-pool perf note is informational.
+2. **`intermediate_states_buffer = [num_layers, num_slots+1, draft_token_num=12, HV, dim, dim]`** (`memory_pool.py:353-357`). The kernel gets the **single-layer slice** `[num_slots+1, 12, HV, V, K]`; **`num_cache_slots = num_slots+1`** (the `+1`); `cache_steps = 12` exact (non-adaptive). V-major confirmed from strides (the `memory_pool.py:353` docstring says `[…,HV,K,V]` but the strides are V-major — trust strides). Wrapper still asserts `cache_steps ≥ T`.
+3. **`allow_neg_eigval = False`** — confirmed (no config key; `fused_gdn_gating` is plain `sigmoid(b)`, no ×2). Flag exposed, defaults False.
+4. **Slot sentinel `PAD_SLOT_ID = -1`** — confirmed. Guard with `slot >= 0` (`fused_sigmoid_gating_recurrent.py:98/131/204/230`); slot 0 is valid (not vLLM's 0/NULL). Only `state_indices` is `-1`-padded; `intermediate_state_indices` is dense `arange` (gate ibuf writes on the pool mask — A1/§3).
+6. **DFlash = linear width-1** (`SPECULATIVE_EAGLE_TOPK=1`; `dflash_worker_v2` passes empty `topk_p`/`topk_index`; `retrieve_*` tree tensors are zeros, populated only when `topk>1`, `hybrid_linear_attn_backend.py:487-489`). The wrapper **accepts-and-ignores** `retrieve_parent_token` (the kernel still receives it, trivial for width-1).
+
+**RESIDUAL (confirm before final ship):**
 5. **FlashInfer numerics** — for SM90/Hopper the Triton fp32-accum path runs; confirm whether bit-matching the FlashInfer SM100 bf16-state adapter is a requirement.
-6. **DFlash verify-entry parity** — DFlash (`speculative/dflash_*`, public upstream) is the confirmed target. Reconcile `recurrent_gated_delta_rule_verify`'s exact arg order / buffer names against DFlash's actual GDN verify call so it's drop-in; tree-only params (e.g. `retrieve_parent_token`) are dropped since the linear chain doesn't use them.
+6b. **DFlash entry parity** — reconcile `recurrent_gated_delta_rule_verify`'s exact arg order / buffer names against DFlash's live GDN verify call so it's drop-in.
 
 ---
 
