@@ -742,3 +742,51 @@ def decode_recur(
                 S[b, h] = Sh
                 o[b, t, h] = scale * (qt @ Sh)  # [V]
     return o, S  # o:[B,T,Hv,V] (only [:, :L_b] valid per b), final_state S:[B,Hv,K,V]
+
+
+def verify_ref(
+    q,
+    k,
+    v,
+    g,
+    beta,  # q,k:[1,T,Hk,128] v:[1,T,Hv,128] g,beta:[1,T,Hv]
+    pool,  # [num_slots, Hv, V=128, K=128] V-major (state_v_first)
+    state_indices,  # [N] int32; <0 => skip (gather + commit)
+    cu_seqlens,  # [N+1] int32; request bb owns flattened tokens [cu_seqlens[bb], cu_seqlens[bb+1])
+    intermediate_states_buffer,  # [num_cache_slots, cache_steps, Hv, V, K] V-major
+    intermediate_state_indices,  # [N] int32 dense (never -1); ibuf write gated by pool slot
+    scale=None,
+    disable_state_update=True,  # no-commit
+):
+    """Reference for the SGLang verify kernel: paged V-major bf16 pool, per-token
+    intermediate states, varlen cu_seqlens, no-commit. Mirrors decode_recur per request."""
+    K = V = 128
+    Hk, Hv = k.shape[2], v.shape[2]
+    grp = Hv // Hk
+    scale = scale if scale is not None else K ** -0.5
+    N = len(cu_seqlens) - 1
+    dev = k.device
+    o = torch.zeros(1, q.shape[1], Hv, V, device=dev, dtype=torch.float32)
+    pool_out = pool.clone()
+    ibuf_out = intermediate_states_buffer.clone()
+    for bb in range(N):
+        slot = int(state_indices[bb])
+        cslot = int(intermediate_state_indices[bb])
+        s0, s1 = int(cu_seqlens[bb]), int(cu_seqlens[bb + 1])
+        for h in range(Hv):
+            hg = h // grp
+            # gather V-major pool[slot,h] [V,K] -> decode state S [K,V]
+            S = (pool[slot, h].float().t().clone() if slot >= 0
+                 else torch.zeros(K, V, device=dev, dtype=torch.float32))
+            for ti, t in enumerate(range(s0, s1)):
+                decay = torch.exp(g[0, t, h].float())
+                S = S * decay
+                kS = k[0, t, hg].float() @ S
+                v_new = beta[0, t, h].float() * (v[0, t, h].float() - kS)
+                S = S + torch.outer(k[0, t, hg].float(), v_new)
+                o[0, t, h] = scale * (q[0, t, hg].float() @ S)
+                if slot >= 0:  # per-token intermediate, V-major [V,K]; gated by POOL slot mask
+                    ibuf_out[cslot, ti, h] = S.t().to(ibuf_out.dtype)
+            if slot >= 0 and not disable_state_update:
+                pool_out[slot, h] = S.t().to(pool_out.dtype)
+    return o, pool_out, ibuf_out
