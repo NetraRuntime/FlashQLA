@@ -4,6 +4,8 @@
 per-token intermediate states, no-commit, varlen cu_seqlens. Host-side gating (g/beta
 pre-activated, q/k pre-l2normed by the wrapper). CUDA-graph safe (no host sync / no alloc
 in the captured entry; all buffers caller-provided)."""
+import os
+
 import torch
 import tilelang
 import tilelang.language as T
@@ -377,7 +379,9 @@ def fused_recurrent_gdr_verify_gated_fwd(
 # steady-state production verify is always captured, and warmup is untimed. Metric scales with H, so
 # small-head configs self-raise the batch needed (gate stays safe for untested H<32).
 PREPASS_MIN_T = 4.0
-PREPASS_MIN_WORK = 384  # graph-calibrated (was 3000, eager-conservative); floor below N=1/T=12 work=416
+# graph-calibrated default 384 (was 3000, eager-conservative); floor below N=1/T=12 work=416.
+# Env-overridable for controlled A/B (set FLASHQLA_PREPASS_MIN_WORK=3000 to reproduce the old gate).
+PREPASS_MIN_WORK = int(os.environ.get("FLASHQLA_PREPASS_MIN_WORK", "384"))
 
 
 def should_use_prepass(N, H, total_tokens):
