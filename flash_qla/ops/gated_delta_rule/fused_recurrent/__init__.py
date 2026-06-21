@@ -15,6 +15,9 @@ if tilelang.contrib.nvcc.get_target_compute_version() == "9.0":
         get_prepass_scratch,
         should_use_prepass,
     )
+    from .hopper.fused_recurrent_replay import (  # noqa: F401
+        fused_recurrent_gdr_replay_fwd,
+    )
 else:
     raise ValueError("FlashQLA now support sm90 only.")
 
@@ -24,6 +27,7 @@ __all__ = [
     "fused_recurrent_gdr_verify_fwd",
     "fused_recurrent_gdr_verify_gated_fwd",
     "recurrent_gated_delta_rule_verify",
+    "recurrent_gated_delta_rule_replay",
 ]
 
 
@@ -161,3 +165,39 @@ def recurrent_gated_delta_rule_verify(
         scale=scale, disable_state_update=disable_state_update,
     )
     return o
+
+
+def recurrent_gated_delta_rule_replay(
+    A_log,
+    a,
+    dt_bias,
+    k,
+    v,
+    b,
+    ssm_states,
+    initial_state_indices,
+    cache_indices,
+    input_sequence_indices,
+    input_sequence_lengths,
+    input_token_start,
+    input_token_stride,
+    allow_neg_eigval=False,
+):
+    """High-level SGLang DFlash K0 reduced-cache REPLAY entry. State-only: recompute the
+    accepted-tail GDN state from the pre-verify state (read from ``initial_state_indices``)
+    and commit it (to ``cache_indices``). Mirrors ``recurrent_gated_delta_rule_verify``'s
+    in-kernel gating + recurrence so the committed state matches verify's step-``accept_len``
+    state bit-for-bit. No q / no output (the verify logits were already produced).
+
+    k:[1,total_tokens,Hk,128] v:[1,total_tokens,Hv,128]; a,b:[1,total_tokens,Hv]; A_log,dt_bias:[Hv]
+    (fp32); ssm_states pool V-major [num_slots,Hv,128,128]. The *_indices/lengths are [N] over the
+    replay subset; ``input_token_start``/``input_token_stride`` are ints (K0: 0 / draft_token_num)."""
+    assert k.dtype == v.dtype and k.dtype != torch.float32
+    assert k.shape[-1] == v.shape[-1] == 128 and v.shape[2] % k.shape[2] == 0
+    return fused_recurrent_gdr_replay_fwd(
+        k, v, a, b, A_log, dt_bias, ssm_states,
+        initial_state_indices, cache_indices,
+        input_sequence_indices, input_sequence_lengths,
+        input_token_start, input_token_stride,
+        allow_neg_eigval=allow_neg_eigval,
+    )

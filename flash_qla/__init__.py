@@ -13,6 +13,7 @@ from flash_qla.ops.gated_delta_rule.fused_recurrent import (
     recurrent_gated_delta_rule,
     fused_recurrent_gdr_verify_fwd,
     recurrent_gated_delta_rule_verify,
+    recurrent_gated_delta_rule_replay,
 )
 
 __all__ = [
@@ -23,4 +24,5 @@ __all__ = [
     "recurrent_gated_delta_rule",
     "fused_recurrent_gdr_verify_fwd",
     "recurrent_gated_delta_rule_verify",
+    "recurrent_gated_delta_rule_replay",
 ]
