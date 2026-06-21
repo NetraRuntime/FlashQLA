@@ -158,6 +158,14 @@ def fused_recurrent_gdr_verify_fwd(
     assert K == V == 128 and H % Hg == 0
     scale = scale or K ** -0.5
     store_intermediate = intermediate_states_buffer is not None
+    # K0 reduced-cache: no per-step store. Bind tiny throwaways (tvm-ffi rejects None); the ibuf
+    # index is compiled out under store_intermediate=False, and cslot (read unconditionally) reuses
+    # the valid [N] state_indices.
+    if not store_intermediate:
+        intermediate_states_buffer = torch.empty(
+            1, 1, H, V, K, device=pool.device, dtype=pool.dtype
+        )
+        intermediate_state_indices = state_indices
 
     # block_DV=64 (2 V-tiles) @ threads=128 is the bandwidth sweet spot (autotuned, H100);
     # 32 (4 V-tiles) for the low-CTA tail. block_DV=128 is occupancy-starved -> never used.
@@ -333,6 +341,16 @@ def fused_recurrent_gdr_verify_gated_fwd(
     assert K == V == 128 and H % Hg == 0
     scale = scale or K ** -0.5
     store_intermediate = intermediate_states_buffer is not None
+    # K0 reduced-cache: no per-step intermediate store. The kernel always DECLARES the ibuf +
+    # intermediate_state_indices params (tvm-ffi rejects None binds), but with
+    # store_intermediate=False the ibuf index is compiled out, so bind tiny throwaways. cslot is
+    # read from intermediate_state_indices unconditionally (only USED under store_intermediate),
+    # so it must be a valid [N] tensor -> reuse state_indices.
+    if not store_intermediate:
+        intermediate_states_buffer = torch.empty(
+            1, 1, H, V, K, device=pool.device, dtype=pool.dtype
+        )
+        intermediate_state_indices = state_indices
 
     grid_base = N * H  # bandwidth sweet spot (autotuned, H100): block_DV=64 @ threads=128
     block_DV = 64 if grid_base * 2 >= TARGET_NUM_CTAS else 32
